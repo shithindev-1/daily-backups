@@ -7,14 +7,19 @@ are grouped here, deterministically, from what was read off them:
     an ID number (National ID, passport or visa number - a visa routinely prints the passport
     number), or have the same date of birth and at least one name in common, or the same name with
     no conflicting date of birth.
-  - Company: one company per trade licence (two copies of one licence - same number or name - are
-    one company). Each person's identity documents are grouped as above, then attached to every
+  - Company: one company per trade licence or initial approval. Two of them are one company when
+    they share a number or the company name - or, for an approval that prints no company name, when it
+    lists a person the licence lists too. Each person's identity documents are grouped as above, then attached to every
     company whose licence lists that person. A company becomes one tenant per attached person, or
     one tenant with no signatory when nobody it lists was uploaded - which then fails, as a company
     needs a listed signatory (see app.services.leasing.tenant_results).
 
-Supporting documents (Ejari, tenancy contract, tenant form, ...) join the tenant whose ID number or
-name they print; with only one tenant they join it; otherwise they stay unassigned.
+Supporting documents (Ejari, tenancy contract, tenant form, ...) join a tenant only when they are
+shown to belong to it - even when the request has a single tenant:
+  - Individual: the document prints the tenant's ID, passport or visa number, or their name. A trade
+    licence or initial approval must LIST the tenant among its members.
+  - Company: the document prints the company's licence number or name.
+A document that belongs to no tenant stays unassigned; the caller reports it as an error.
 
 Each unit is one document: a key (anything hashable the caller uses to find it again), its type,
 and its extracted fields.
@@ -29,6 +34,9 @@ from app.services.names import name_tokens, same_name
 
 PERSON_TYPES = frozenset({"national_id", "passport", "visa"})
 COMPANY_TYPE = "trade_license"
+# Documents that describe a company and list its people. For an individual they are matched on that
+# list, never on the tenant fields.
+LICENCE_TYPES = frozenset({"trade_license", "initial_approval"})
 
 _INDIVIDUAL_IDS = ("National_Id", "Passport_Number", "Visa_Number")
 _SIGNATORY_IDS = ("Signatory_National_Id", "Signatory_Passport_Number", "Signatory_Visa_Number")
@@ -130,35 +138,52 @@ def _group_people(units: list[Unit], company: bool) -> list[_Person]:
 
 
 def _identity(unit: Unit, company: bool) -> tuple[set[str], str | None]:
-    """What a supporting document is matched on: the company's licence number and name for a
-    company, the person's ID numbers and name for an individual."""
+    """What a supporting document is matched on: the company's licence or approval number and name
+    for a company, the person's ID numbers and name for an individual."""
     if company:
-        number = _id(unit.data.get("Trade_License_Number"))
-        return ({number} if number else set()), unit.data.get("Company_Name_En")
+        numbers = {_id(unit.data.get(field)) for field in ("Trade_License_Number", "Initial_Approval_Number")}
+        return {number for number in numbers if number}, unit.data.get("Company_Name_En")
     ids, name, _ = _person_details(unit, company=False)
     return ids, name
+
+
+def has_link_details(unit: Unit, company: bool) -> bool:
+    """Whether anything was read off the document that it could be matched on at all - so a
+    document that names someone else can be told apart from one whose details were unreadable."""
+    if not company and unit.document_type in LICENCE_TYPES:
+        return bool(_members(unit))
+    ids, name = _identity(unit, company)
+    return bool(ids or name)
+
+
+def _belongs(unit: Unit, tenant: Tenant, unit_by_key: dict[Hashable, Unit], company: bool) -> bool:
+    """Whether a supporting document is shown to belong to `tenant` - see the module docstring."""
+    if company:
+        ids, name = _identity(unit, company=True)
+        for key in tenant.company_keys:
+            own_ids, own_name = _identity(unit_by_key[key], company=True)
+            if (ids & own_ids) or (name and own_name and same_name(name, own_name)):
+                return True
+        return False
+    own = [_identity(unit_by_key[key], company=False) for key in tenant.keys
+           if unit_by_key[key].document_type in PERSON_TYPES]
+    own_names = [own_name for _, own_name in own if own_name]
+    if unit.document_type in LICENCE_TYPES:
+        return any(same_name(member, own_name) for member in _members(unit) for own_name in own_names)
+    ids, name = _identity(unit, company=False)
+    return any(ids & own_ids for own_ids, _ in own) or bool(
+        name and any(same_name(name, own_name) for own_name in own_names)
+    )
 
 
 def _attach_supporting(
     supporting: list[Unit], tenants: list[Tenant], unit_by_key: dict[Hashable, Unit], company: bool,
 ) -> list[Hashable]:
-    """Adds each supporting document to the tenant(s) it names; returns those that fit none. A
-    company document joins every tenant of that company (one per signatory)."""
+    """Adds each supporting document to the tenant(s) it belongs to; returns those that belong to
+    none. A company document joins every tenant of that company (one per signatory)."""
     unassigned: list[Hashable] = []
     for unit in supporting:
-        if len(tenants) == 1:
-            tenants[0].keys.append(unit.key)
-            continue
-        ids, name = _identity(unit, company)
-
-        def names_it(tenant: Tenant) -> bool:
-            for key in tenant.company_keys if company else tenant.keys:
-                own_ids, own_name = _identity(unit_by_key[key], company)
-                if (ids & own_ids) or (name and own_name and same_name(name, own_name)):
-                    return True
-            return False
-
-        owners = [tenant for tenant in tenants if names_it(tenant)]
+        owners = [tenant for tenant in tenants if _belongs(unit, tenant, unit_by_key, company)]
         if not owners:
             unassigned.append(unit.key)
         for tenant in owners if company else owners[:1]:
@@ -187,15 +212,29 @@ def _members(unit: Unit) -> list[str]:
 def group_companies(units: list[Unit]) -> Grouping:
     unit_by_key = {unit.key: unit for unit in units}
 
+    # Licences first, so an initial approval of the same company joins the licence's company.
+    anchors = sorted(
+        (unit for unit in units if unit.document_type in LICENCE_TYPES),
+        key=lambda unit: unit.document_type != COMPANY_TYPE,
+    )
     companies: list[list[Unit]] = []
-    for unit in (unit for unit in units if unit.document_type == COMPANY_TYPE):
-        number, name = _id(unit.data.get("Trade_License_Number")), unit.data.get("Company_Name_En")
+    for unit in anchors:
+        numbers, name = _identity(unit, company=True)
+        members = _members(unit)
+
+        def same_company(company: list[Unit]) -> bool:
+            for other in company:
+                other_numbers, other_name = _identity(other, company=True)
+                if (numbers & other_numbers) or (name and other_name and same_name(name, other_name)):
+                    return True
+            # An approval printing no company name: the same company when it lists a person the
+            # company's licence lists too.
+            return bool(not name and unit.document_type != COMPANY_TYPE and any(
+                same_name(member, listed) for listed in members for other in company for member in _members(other)
+            ))
+
         for company in companies:
-            if any(
-                (number and number == _id(other.data.get("Trade_License_Number")))
-                or (name and same_name(name, other.data.get("Company_Name_En")))
-                for other in company
-            ):
+            if same_company(company):
                 company.append(unit)
                 break
         else:
@@ -221,6 +260,6 @@ def group_companies(units: list[Unit]) -> Grouping:
             ))
     unlisted = [person.keys for index, person in enumerate(people) if index not in listed]
 
-    supporting = [unit for unit in units if unit.document_type not in PERSON_TYPES and unit.document_type != COMPANY_TYPE]
+    supporting = [unit for unit in units if unit.document_type not in PERSON_TYPES and unit.document_type not in LICENCE_TYPES]
     unassigned = _attach_supporting(supporting, tenants, unit_by_key, company=True)
     return Grouping(tenants=tenants, unassigned=unassigned, unlisted_people=unlisted)

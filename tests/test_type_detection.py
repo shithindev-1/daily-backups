@@ -190,7 +190,7 @@ def test_missing_trade_licence_is_rejected_for_a_company(client: TestClient, mon
     response = _upload(client, ["eid.png"], tenant_type="company")
 
     assert response.status_code == 400
-    assert response.json()["detail"].startswith("A trade licence is required for a company.")
+    assert response.json()["detail"].startswith("A trade licence or initial approval is required for a company.")
 
 
 def test_company_with_a_listed_signatory_succeeds(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -235,10 +235,12 @@ def test_company_whose_listed_people_were_not_uploaded_fails(
     assert (tenant["status"], tenant["company_name_en"]) == ("failed", None)
     licence, person = body["documents"]
     assert licence["error"] == (
-        "None of the people listed on this trade licence were uploaded. "
-        "Please upload the ID documents of a person listed on the licence."
+        "None of the people listed on this trade licence or initial approval were uploaded. "
+        "Please upload the ID documents of a person it lists."
     )
-    assert person["error"].startswith("The person on 'National ID' is not listed on any uploaded trade licence.")
+    assert person["error"].startswith(
+        "The person on 'National ID' is not listed on any uploaded trade licence or initial approval."
+    )
 
 
 def test_expired_document_is_rejected_with_its_own_message(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -563,7 +565,9 @@ def test_company_tenants_are_one_per_licence_and_listed_signatory(client: TestCl
     assert body["status"] == "failed"
     zaid = body["documents"][-1]
     assert zaid["tenant_ids"] == []
-    assert zaid["error"].startswith("The person on 'National ID 3' is not listed on any uploaded trade licence.")
+    assert zaid["error"].startswith(
+        "The person on 'National ID 3' is not listed on any uploaded trade licence or initial approval."
+    )
 
 
 def test_processed_files_are_named_after_their_type(
@@ -753,13 +757,13 @@ def test_each_document_of_one_file_is_uploaded_as_its_own_pdf(
 
     assert body["status"] == "success"
     # One file in, two separate processed files out - each a PDF named after its type.
-    assert sorted(storage.uploads) == [f"{FOLDER}/National_ID.pdf", f"{FOLDER}/Passport.pdf"]
+    assert sorted(storage.uploads) == [f"{FOLDER}/Tenant_1_National_ID.pdf", f"{FOLDER}/Tenant_1_Passport.pdf"]
     assert all(content.startswith(b"%PDF-") and kind == "application/pdf" for content, kind in storage.uploads.values())
     assert [d["sources"][0]["ocr_file"] for d in body["documents"]] == [
-        f"{CONTAINER}/{FOLDER}/National_ID.pdf", f"{CONTAINER}/{FOLDER}/Passport.pdf",
+        f"{CONTAINER}/{FOLDER}/Tenant_1_National_ID.pdf", f"{CONTAINER}/{FOLDER}/Tenant_1_Passport.pdf",
     ]
     # A copy of each is also kept on the server, in the request's own folder.
-    assert sorted(path.name for path in (tmp_path / "app-1").glob("*.pdf")) == ["National_ID.pdf", "Passport.pdf"]
+    assert sorted(path.name for path in (tmp_path / "app-1").glob("*.pdf")) == ["Tenant_1_National_ID.pdf", "Tenant_1_Passport.pdf"]
 
 
 def test_an_uploaded_file_gets_a_local_pdf_as_its_ocr_file(
@@ -770,7 +774,7 @@ def test_an_uploaded_file_gets_a_local_pdf_as_its_ocr_file(
     body = _upload(client, ["eid.png"]).json()
 
     ocr_file = Path(body["documents"][0]["sources"][0]["ocr_file"])
-    assert ocr_file.name == "National_ID.pdf"
+    assert ocr_file.name == "Tenant_1_National_ID.pdf"
     assert ocr_file.read_bytes().startswith(b"%PDF-")
 
 
@@ -828,3 +832,232 @@ def test_corners_on_a_0_to_1000_scale_are_read_as_such() -> None:
     assert _fractions(corners)[0] == {"x": 0.639, "y": 0.027}
     fractions = [{"x": 0.1, "y": 0.2}] * 4
     assert _fractions(fractions) == fractions
+
+
+# --- every supporting document must be shown to belong to a tenant ------------------------------
+
+MAGDY = {"Tenant_Name_En": "Magdy Abdelrehim Ibrahim Ali", "Date_Of_Birth": "04/05/1971"}
+
+
+def _magdy_with(monkeypatch: pytest.MonkeyPatch, extra_name: str, extra_type: str, extra: dict[str, Any]) -> None:
+    """One photo with Magdy's passport, ID front and back, and residence visa - plus one extra file."""
+    _stub(
+        monkeypatch,
+        segments={
+            "photo.png": [
+                _region("passport", 1, TOP_HALF),
+                _region("national_id", 2, [{"x": 0.6, "y": 0.02}, {"x": 0.98, "y": 0.02}, {"x": 0.98, "y": 0.2}, {"x": 0.6, "y": 0.2}], "front"),
+                _region("national_id", 2, [{"x": 0.6, "y": 0.25}, {"x": 0.98, "y": 0.25}, {"x": 0.98, "y": 0.45}, {"x": 0.6, "y": 0.45}], "back"),
+                _region("visa", 3, BOTTOM_HALF),
+            ],
+            extra_name: [_region(extra_type, 1)],
+        },
+        answers={
+            "photo_1_passport": _raw(["passport"], Passport_Number="A28334482", **MAGDY),
+            "photo_2_national_id": _raw(["national_id"], National_Id="784-1971-6060254-2", **MAGDY),
+            "photo_3_visa": _raw(["visa"], Visa_Number="201/2023/7/434798", Passport_Number="A28334482", **MAGDY),
+            extra_name: _raw([extra_type], DATA_FIELDS + ["License_Members"], **extra),
+        },
+    )
+
+
+def test_a_trade_licence_that_does_not_list_the_tenant_is_rejected_on_its_own(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The reported case: the person's own documents are fine; the licence belongs to someone else.
+    _magdy_with(monkeypatch, "licence.png", "trade_license", {
+        "License_Members": "Bhargava Subhash Kalluri (Manager)", "Resident_City": "Dubai",
+    })
+
+    body = _upload(client, ["photo.png", "licence.png"]).json()
+
+    [tenant] = body["form_data"]
+    assert tenant["status"] == "success"
+    assert (tenant["tenant_name_en"], tenant["passport_number"]) == ("Magdy Abdelrehim Ibrahim Ali", "A28334482")
+    # Nothing is taken from the licence.
+    assert tenant["resident_city"] is None
+    by_type = {d["document_type"]: d for d in body["documents"]}
+    assert [by_type[t]["status"] for t in ("passport", "national_id", "visa")] == ["valid", "valid", "valid"]
+    licence = by_type["trade_license"]
+    assert (licence["status"], licence["tenant_ids"]) == ("invalid", [])
+    assert licence["error"] == (
+        "'Trade licence' doesn't list the tenant. Please upload a trade licence that lists the tenant, or remove it."
+    )
+    # The request as a whole still says something needs fixing.
+    assert body["status"] == "failed"
+
+
+def test_a_trade_licence_that_lists_the_tenant_is_accepted_but_adds_no_data(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _magdy_with(monkeypatch, "licence.png", "trade_license", {
+        "License_Members": "MAGDY ABDELREHIM IBRAHIM ALI (Owner)", "Resident_City": "Dubai",
+    })
+
+    body = _upload(client, ["photo.png", "licence.png"]).json()
+
+    assert body["status"] == "success"
+    licence = next(d for d in body["documents"] if d["document_type"] == "trade_license")
+    assert (licence["status"], licence["tenant_ids"]) == ("valid", ["tenant_1"])
+    assert body["form_data"][0]["resident_city"] is None
+
+
+@pytest.mark.parametrize(("extra", "expected"), [
+    ({"Tenant_Name_En": "Magdy Abdelrehim Ibrahim Ali"}, None),
+    ({"National_Id": "784197160602542"}, None),
+    ({"Tenant_Name_En": "Sara Ali"},
+     "'Ejari certificate' doesn't mention the tenant. Please upload the tenant's own Ejari certificate, or remove it."),
+    ({}, "We couldn't confirm that 'Ejari certificate' belongs to the tenant. Please upload a clearer copy."),
+])
+def test_a_supporting_document_must_name_the_tenant(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, extra: dict[str, Any], expected: str | None,
+) -> None:
+    _magdy_with(monkeypatch, "ejari.png", "ejari_certificate", extra)
+
+    body = _upload(client, ["photo.png", "ejari.png"]).json()
+
+    ejari = next(d for d in body["documents"] if d["document_type"] == "ejari_certificate")
+    assert ejari["error"] == expected
+    assert body["form_data"][0]["status"] == "success"
+    assert body["status"] == ("success" if expected is None else "failed")
+
+
+def test_a_company_document_must_be_for_the_licence_company(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    company_fields = COMPANY_DATA_FIELDS + ["License_Members", "Holder_Name"]
+    _stub(
+        monkeypatch,
+        segments={
+            "tl.png": [_region("trade_license", 1)], "eid.png": [_region("national_id", 1)],
+            "ejari.png": [_region("ejari_certificate", 1)],
+        },
+        answers={
+            "tl.png": _raw(["trade_license"], company_fields, Company_Name_En="Al Frejun L.L.C-FZ",
+                           Trade_License_Number="2527004.01", License_Members="Bhargava Subhash Kalluri (Manager)"),
+            "eid.png": _raw(["national_id"], company_fields, Signatory_Name_En="Bhargava Subhash Kalluri"),
+            "ejari.png": _raw(["ejari_certificate"], company_fields, Company_Name_En="Beta Foods LLC"),
+        },
+    )
+
+    body = _upload(client, ["tl.png", "eid.png", "ejari.png"], tenant_type="company").json()
+
+    assert body["form_data"][0]["status"] == "success"
+    ejari = next(d for d in body["documents"] if d["document_type"] == "ejari_certificate")
+    assert ejari["error"] == (
+        "'Ejari certificate' is not for the company on the trade licence or initial approval. "
+        "Please upload the company's own Ejari certificate, or remove it."
+    )
+
+
+def test_a_passports_home_country_number_never_becomes_the_national_id(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An Egyptian passport prints a national number; the tenant's National ID is the Emirates ID.
+    # Occupation is taken from the Emirates ID over the older passport.
+    _stub(
+        monkeypatch,
+        segments={"pp.png": [_region("passport", 1)], "eid.png": [_region("national_id", 1)]},
+        answers={
+            "pp.png": _raw(["passport"], National_Id="27105041401018", Passport_Number="A28334482",
+                           Occupation="ARCHITECTURAL ENGINEER", **MAGDY),
+            "eid.png": _raw(["national_id"], National_Id="784-1971-6060254-2", Occupation="Chief Executive Officer", **MAGDY),
+        },
+    )
+    sent: list[list[dict[str, Any]]] = []
+
+    async def fake_cross(**kwargs: Any) -> list[str]:
+        sent.append(kwargs["documents"])
+        return []
+
+    monkeypatch.setattr(settings, "validation_enabled", True)
+    monkeypatch.setattr(get_gemini_service(), "verify_document", lambda **kwargs: _no_issues())
+    monkeypatch.setattr(get_gemini_service(), "verify_documents_cross", fake_cross)
+
+    body = _upload(client, ["pp.png", "eid.png"]).json()
+
+    [tenant] = body["form_data"]
+    assert (tenant["national_id"], tenant["occupation"]) == ("784-1971-6060254-2", "Chief Executive Officer")
+    passport = next(document for document in sent[0] if document["document_type"] == "passport")
+    assert passport["data"]["National_Id"] is None
+
+
+async def _no_issues() -> list[str]:
+    return []
+
+
+def test_a_numbered_document_is_named_once_and_the_fix_uses_its_plain_type() -> None:
+    from app.services.leasing.tenant_results import _unmatched_message
+    from app.services.type_detection.tenants import Unit
+
+    unit = Unit(key=(3,), document_type="ejari_certificate", data={"Tenant_Name_En": "Someone Else"})
+    assert _unmatched_message(unit, "Ejari certificate 2", company=False, several=False) == (
+        "'Ejari certificate 2' doesn't mention the tenant. Please upload the tenant's own Ejari certificate, or remove it."
+    )
+
+
+
+# --- company: a trade licence OR an initial approval; the approval has its own form_data keys -----
+
+APPROVAL_FIELDS = COMPANY_DATA_FIELDS + [
+    "Initial_Approval_Number", "Initial_Approval_Issue_Date", "Initial_Approval_Expiry", "Initial_Approval_Issuer",
+    "License_Members", "Holder_Name",
+]
+
+
+def test_a_company_with_only_an_initial_approval_is_accepted(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub(
+        monkeypatch,
+        segments={"approval.png": [_region("initial_approval", 1)], "eid.png": [_region("national_id", 1)]},
+        answers={
+            "approval.png": _raw(["initial_approval"], APPROVAL_FIELDS,
+                                 Initial_Approval_Number="1788073", Initial_Approval_Issue_Date="21/07/2026",
+                                 Initial_Approval_Expiry="21/01/2027", Initial_Approval_Issuer="Dep. of Economic Development",
+                                 License_Members="Cyro Alessandro Martins Cardoso (Partner); Alaa Mohamed Eltom (Partner)"),
+            "eid.png": _raw(["national_id"], APPROVAL_FIELDS, Signatory_Name_En="Cyro Alessandro Martins Cardoso",
+                            Signatory_National_Id="784-1997-0472920-3"),
+        },
+    )
+
+    body = _upload(client, ["approval.png", "eid.png"], tenant_type="company").json()
+
+    assert body["status"] == "success"
+    [tenant] = body["form_data"]
+    assert (tenant["initial_approval_number"], tenant["initial_approval_issue_date"], tenant["initial_approval_expiry"],
+            tenant["initial_approval_issuer"]) == ("1788073", "21/07/2026", "21/01/2027", "Dep. of Economic Development")
+    # The trade licence keys stay empty - an approval is not a licence.
+    assert tenant["trade_license_number"] is None and "trade_license_number" in body["missing"][0]["fields"]
+    assert (tenant["signatory_name_en"], tenant["signatory_designation"]) == ("Cyro Alessandro Martins Cardoso", "Partner")
+
+
+def test_a_licence_and_an_approval_of_one_company_are_one_tenant(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The approval prints no company name, but lists the licence's own manager.
+    _stub(
+        monkeypatch,
+        segments={
+            "tl.png": [_region("trade_license", 1)], "approval.png": [_region("initial_approval", 1)],
+            "eid.png": [_region("national_id", 1)],
+        },
+        answers={
+            "tl.png": _raw(["trade_license"], APPROVAL_FIELDS, Company_Name_En="Alpha Trading LLC",
+                           Trade_License_Number="1001", License_Members="Cyro Alessandro Martins Cardoso (Manager)"),
+            "approval.png": _raw(["initial_approval"], APPROVAL_FIELDS, Initial_Approval_Number="1788073",
+                                 License_Members="Cyro Alessandro Martins Cardoso (Partner)"),
+            "eid.png": _raw(["national_id"], APPROVAL_FIELDS, Signatory_Name_En="Cyro Alessandro Martins Cardoso"),
+        },
+    )
+
+    body = _upload(client, ["tl.png", "approval.png", "eid.png"], tenant_type="company").json()
+
+    assert body["status"] == "success"
+    [tenant] = body["form_data"]
+    assert (tenant["trade_license_number"], tenant["initial_approval_number"]) == ("1001", "1788073")
+    assert all(document["tenant_ids"] == ["tenant_1"] for document in body["documents"])
+
+
+def test_individual_responses_have_no_approval_keys(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub(monkeypatch, segments={"eid.png": [_region("national_id", 1)]}, answers={"eid.png": _raw(["national_id"])})
+
+    body = _upload(client, ["eid.png"]).json()
+
+    assert not any(key.startswith("initial_approval") for key in body["form_data"][0])
