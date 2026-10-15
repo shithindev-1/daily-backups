@@ -93,6 +93,8 @@ def _batch_item(item: dict[str, Any], segment: Segment, label: str, number: int)
             batch_item["blob_path"] = item["blob_path"]
         return batch_item
 
+    # Already cut to its own edges, with other documents blanked out: the final crop takes it whole.
+    batch_item["precut"] = True
     stem = Path(item["filename"]).stem or "document"
     filename = f"{safe_name(stem)}_{document_id}{segment.extension}"
     batch_item.update(content=segment.content, filename=filename, content_type=ALLOWED_FILES[segment.extension])

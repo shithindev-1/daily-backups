@@ -276,6 +276,7 @@ async def process_batch(
                 sha256=document["sha256"],
                 settings=per_document_settings,
                 gemini_service=get_gemini_service(),
+                box_detection=not items[upload_indices[0]].get("precut"),
             )
             if is_merged and saved_paths:
                 merged_pdf = await asyncio.to_thread(

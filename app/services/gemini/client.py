@@ -23,6 +23,7 @@ from app.services.gemini.prompts import (
     BOX_DETECTION_SCHEMA,
     COMPANY_CROSS_VERIFICATION_PROMPT,
     COMPANY_SYSTEM_INSTRUCTION,
+    CONFLICTS_SCHEMA,
     COUNTRY_CODE_PROMPT,
     COUNTRY_CODE_SCHEMA,
     CROSS_VERIFICATION_PROMPT,
@@ -39,6 +40,7 @@ from app.services.gemini.prompts import (
     SHORT_CROSS_MESSAGES,
     SHORT_SELF_MESSAGES,
     SYSTEM_INSTRUCTION,
+    covered_parts_rules,
 )
 from app.services.gemini.usage import (
     CALL_CROP,
@@ -499,7 +501,7 @@ class GeminiService:
         today_text = f"{today.strftime('%d/%m/%Y')} ({today.strftime('%d %B %Y')})"
         prompt = SELF_VERIFICATION_PROMPT.format(document_type=document_type, today=today_text)
         if short_messages:
-            prompt += SHORT_SELF_MESSAGES
+            prompt += SHORT_SELF_MESSAGES + covered_parts_rules(document_type)
         message_content = [
             types.Part.from_bytes(data=content, mime_type=media_type),
             types.Part.from_text(text=prompt),
@@ -539,8 +541,10 @@ class GeminiService:
     async def verify_documents_cross(
         self, *, documents: list[dict[str, Any]], tenant_type: str | None = None,
         short_messages: bool = False,
-    ) -> list[str]:
+    ) -> list[Any]:
         """Cross-document verification over already-extracted fields, text-only.
+
+        Returns sentences, or - with `short_messages` - conflict dicts {documents, detail, message}.
 
         `documents` is `{"label", "document_type", "data"}` per document - the same fields the
         caller's own response already carries, nothing re-sent from the original images. Comparing
@@ -576,16 +580,17 @@ class GeminiService:
                 # budget, so the room is generous - only tokens actually generated are billed.
                 max_output_tokens=VERIFICATION_MAX_OUTPUT_TOKENS,
                 response_mime_type="application/json",
-                response_schema=ISSUES_SCHEMA,
+                # Short mode (type-detection): structured conflicts, worded per document in code.
+                response_schema=CONFLICTS_SCHEMA if short_messages else ISSUES_SCHEMA,
             ),
         )
         text = self._response_text(response)
         if not text:
             raise ValueError(f"Gemini returned no text part for cross-verification ({self._finish_details(response)})")
         parsed = json.loads(text)
-        issues = parsed.get("issues")
+        issues = parsed.get("conflicts" if short_messages else "issues")
         if not isinstance(issues, list):
-            raise ValueError(f"Expected an issues list from cross-verification, got {issues!r}")
+            raise ValueError(f"Expected a list from cross-verification, got {issues!r}")
         usage = getattr(response, "usage_metadata", None)
         input_tokens, _, _ = self._usage_tokens(usage)
         record_usage(CALL_VALIDATION, input_tokens, self._output_total(usage))
@@ -593,6 +598,8 @@ class GeminiService:
             "Cross-verification usage input_tokens=%s output_tokens=%s documents=%d issues=%d",
             input_tokens, self._output_total(usage), len(documents), len(issues),
         )
+        if short_messages:
+            return [issue for issue in issues if isinstance(issue, dict)]
         return [str(issue) for issue in issues]
 
     async def verify_document_pair(

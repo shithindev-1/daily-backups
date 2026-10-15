@@ -415,7 +415,9 @@ def _drop_duplicate_regions(detections: list[PageDetection]) -> list[PageDetecti
     return [replace(detection, region_number=number) for number, detection in enumerate(kept, start=1)]
 
 
-def page_detections(*, page_number: int, width: int, height: int, page_result: dict[str, Any]) -> list[PageDetection]:
+def page_detections(
+    *, page_number: int, width: int, height: int, page_result: dict[str, Any], drop_duplicates: bool = True,
+) -> list[PageDetection]:
     # One page/frame can hold several separate physical documents (a card's front and back
     # photographed side by side, say), so each entry Gemini reports becomes its own detection —
     # and its own crop — rather than being merged into a single box covering both.
@@ -440,7 +442,7 @@ def page_detections(*, page_number: int, width: int, height: int, page_result: d
             )
 
     if detections:
-        return _drop_duplicate_regions(detections)
+        return _drop_duplicate_regions(detections) if drop_duplicates else detections
     return [
         _detection_from_corners(
             page_number=page_number,
@@ -783,7 +785,13 @@ async def run_detection(
     sha256: str,
     settings: Settings,
     gemini_service: DocumentVision,
+    box_detection: bool = True,
 ) -> list[Path] | None:
+    """Crops, rotates and enhances every document in a file and saves the results.
+
+    `box_detection=False` is for a file that already holds exactly one document cut to its own edges
+    (a type-detection cut-out): each page is taken whole, so no second detection call is made and
+    nothing next to the document can be picked up again - only orientation and enhancement run."""
     # Rendering/encoding/cropping/saving are CPU-bound and offloaded to worker threads so they
     # never block the event loop; the Gemini call in between is awaited natively so it runs
     # concurrently with the main extraction call in app/services/ocr_pipeline.py, not serially after it.
@@ -791,7 +799,10 @@ async def run_detection(
     try:
         images = await asyncio.to_thread(render_pages, content, mime_type, settings.detection_pdf_dpi)
         encoded_pages = await asyncio.to_thread(_encode_pages_for_detection, images)
-        page_results = await gemini_service.detect_box_corners(encoded_pages)
+        page_results = (
+            await gemini_service.detect_box_corners(encoded_pages) if box_detection
+            else [{"found": False, "documents": []} for _ in images]
+        )
         pairs = [
             (detection, image)
             for index, image in enumerate(images)

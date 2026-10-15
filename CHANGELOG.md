@@ -25,6 +25,12 @@ major version means a change that existing callers must adapt to.
   (`04-Apr-2024`, `2024/04/28`, `28/04/2024`, `15-04-2026` -> `04-04-2024`, `28-04-2024`, `28-04-2024`, `15-04-2026`).
 
 ### Changed (type-detection endpoints)
+- **Cross-check messages are written per document:** when documents disagree (e.g. a visa and a passport
+  with different passport numbers), each document gets its own message from its own point of view instead of
+  one shared sentence. The model now reports what disagrees (documents + detail); the wording is done in code.
+- **New `form_data` keys for both tenant types:** `tenant_mobile_number` and `tenant_email` - the tenant's
+  own contact details (for a company, the company tenant's), copied exactly as printed, read only where a
+  document labels them as the tenant's. Type-detection endpoints only; the old endpoints are unchanged.
 - Dates inside `documents[].error` messages are written as `DD-MM-YYYY` too.
 - **Company: a trade licence or an initial approval** now satisfies the mandatory-document rule
   (the old `/ocr/leasing` endpoints still require a trade licence). An initial approval anchors the

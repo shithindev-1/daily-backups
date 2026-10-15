@@ -1068,3 +1068,138 @@ def test_short_messages_ask_for_dd_mm_yyyy_dates() -> None:
 
     assert "DD-MM-YYYY" in SHORT_SELF_MESSAGES and "DD-MM-YYYY" in SHORT_CROSS_MESSAGES
     assert "12/05/2023" not in SHORT_SELF_MESSAGES
+
+
+# --- tenant mobile number and email (type-detection endpoints only) -------------------------------
+
+
+def test_individual_contact_details_are_returned_exactly_as_printed(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fields = DATA_FIELDS + ["Tenant_Mobile_Number", "Tenant_Email", "License_Members"]
+    _stub(
+        monkeypatch,
+        segments={"eid.png": [_region("national_id", 1)], "form.png": [_region("tenant_form", 1)]},
+        answers={
+            "eid.png": _raw(["national_id"], fields, **MAGDY),
+            "form.png": _raw(["tenant_form"], fields, Tenant_Mobile_Number="050 123 4567",
+                             Tenant_Email="Magdy.Ali@example.com", **MAGDY),
+        },
+    )
+
+    body = _upload(client, ["eid.png", "form.png"]).json()
+
+    [tenant] = body["form_data"]
+    assert (tenant["tenant_mobile_number"], tenant["tenant_email"]) == ("050 123 4567", "Magdy.Ali@example.com")
+    assert list(tenant)[-2:] == ["tenant_mobile_number", "tenant_email"]
+
+
+def test_missing_contact_details_are_listed_in_missing(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub(monkeypatch, segments={"eid.png": [_region("national_id", 1)]}, answers={"eid.png": _raw(["national_id"])})
+
+    body = _upload(client, ["eid.png"]).json()
+
+    assert {"tenant_mobile_number", "tenant_email"} <= set(body["missing"][0]["fields"])
+
+
+def test_company_contact_details_are_the_company_tenants(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    fields = COMPANY_DATA_FIELDS + ["Tenant_Mobile_Number", "Tenant_Email", "License_Members", "Holder_Name"]
+    _stub(
+        monkeypatch,
+        segments={"tl.png": [_region("trade_license", 1)], "eid.png": [_region("national_id", 1)],
+                  "ejari.png": [_region("ejari_certificate", 1)]},
+        answers={
+            "tl.png": _raw(["trade_license"], fields, Company_Name_En="Al Frejun L.L.C-FZ",
+                           Trade_License_Number="2527004.01", License_Members="Bhargava Subhash Kalluri (Manager)"),
+            "eid.png": _raw(["national_id"], fields, Signatory_Name_En="Bhargava Subhash Kalluri"),
+            "ejari.png": _raw(["ejari_certificate"], fields, Company_Name_En="Al Frejun L.L.C-FZ",
+                              Tenant_Mobile_Number="+971 4 123 4567", Tenant_Email="info@alfrejun.ae"),
+        },
+    )
+
+    body = _upload(client, ["tl.png", "eid.png", "ejari.png"], tenant_type="company").json()
+
+    [tenant] = body["form_data"]
+    assert (tenant["tenant_mobile_number"], tenant["tenant_email"]) == ("+971 4 123 4567", "info@alfrejun.ae")
+
+
+def test_old_endpoints_do_not_return_contact_details() -> None:
+    from app.schemas.ocr import COMPANY_MISSING_INFO_FIELDS, MISSING_INFO_FIELDS, fields_for_tenant_type
+
+    for tenant_type in ("individual", "company"):
+        _, keys = fields_for_tenant_type(tenant_type)
+        assert "tenant_mobile_number" not in keys and "tenant_email" not in keys
+    assert "tenant_email" not in MISSING_INFO_FIELDS + COMPANY_MISSING_INFO_FIELDS
+
+
+# --- cross-check: one message per document, from that document's point of view -------------------
+
+
+def test_a_passport_and_visa_conflict_gives_each_document_its_own_message(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "validation_enabled", True)
+    _stub(
+        monkeypatch,
+        segments={"visa.png": [_region("visa", 1)], "eid.png": [_region("national_id", 1)],
+                  "pp.png": [_region("passport", 1)]},
+        answers={
+            "visa.png": _raw(["visa"], Passport_Number="A1111111", **MAGDY),
+            "eid.png": _raw(["national_id"], **MAGDY),
+            "pp.png": _raw(["passport"], Passport_Number="A2222222", **MAGDY),
+        },
+    )
+
+    async def fake_cross(**kwargs: Any) -> list[dict[str, Any]]:
+        assert kwargs.get("short_messages") is True
+        return [{"documents": ["Visa", "Passport"], "detail": "passport_number", "message": ""}]
+
+    monkeypatch.setattr(get_gemini_service(), "verify_document", lambda **kwargs: _no_issues())
+    monkeypatch.setattr(get_gemini_service(), "verify_documents_cross", fake_cross)
+
+    body = _upload(client, ["visa.png", "eid.png", "pp.png"]).json()
+
+    errors = {d["document_type"]: d["error"] for d in body["documents"]}
+    assert errors["visa"] == (
+        "'Visa' shows a different passport number than 'Passport'. Please upload the visa issued for this passport."
+    )
+    assert errors["passport"] == (
+        "The passport number on 'Passport' is different from the one on 'Visa'. "
+        "Please check you uploaded the right passport."
+    )
+    assert errors["national_id"] is None
+
+
+@pytest.mark.parametrize(("conflict", "document", "expected"), [
+    ({"documents": ["National ID", "Passport"], "detail": "date_of_birth"}, "National ID",
+     "'National ID' shows a different date of birth from 'Passport'. Please upload documents of the same person."),
+    ({"documents": ["National ID", "Passport"], "detail": "date_of_birth"}, "Passport",
+     "'Passport' shows a different date of birth from 'National ID'. Please upload documents of the same person."),
+    ({"documents": ["Trade licence", "Ejari certificate"], "detail": "company_name"}, "Ejari certificate",
+     "'Ejari certificate' shows a different company name from 'Trade licence'. Please upload documents of the same company."),
+    ({"documents": ["Passport", "Trade licence"], "detail": "listed_person"}, "Passport",
+     "The person on 'Passport' is not listed on 'Trade licence'. Please upload the documents of a person it lists."),
+    ({"documents": ["Passport", "Trade licence"], "detail": "listed_person"}, "Trade licence",
+     "'Trade licence' doesn't list the person on 'Passport'. Please upload the documents of a person it lists."),
+    ({"documents": ["Visa", "National ID"], "detail": "national_id_number"}, "National ID",
+     "The ID number on 'National ID' is different from the one on 'Visa'. Please check you uploaded the right National ID."),
+    ({"documents": ["Visa", "Passport"], "detail": "other", "message": "'Visa' and 'Passport' disagree."}, "Visa",
+     "'Visa' and 'Passport' disagree."),
+])
+def test_conflict_messages_are_worded_for_each_document(conflict: dict[str, Any], document: str, expected: str) -> None:
+    from app.services.leasing.cross_messages import message_for
+
+    types = {"National ID": "national_id", "Passport": "passport", "Visa": "visa",
+             "Trade licence": "trade_license", "Ejari certificate": "ejari_certificate"}
+    assert message_for(document, conflict, types) == expected
+
+
+def test_conflict_documents_named_by_type_or_case_still_resolve() -> None:
+    from app.services.leasing.cross_messages import resolve_documents
+
+    types = {"Visa": "visa", "Passport": "passport", "National ID": "national_id",
+             "National ID 1": "national_id", "National ID 2": "national_id"}
+    assert resolve_documents(["visa", "PASSPORT"], types) == ["Visa", "Passport"]
+    assert resolve_documents(["'Visa'", "Passport"], types) == ["Visa", "Passport"]
+    # Ambiguous type: several National IDs - not guessed.
+    assert resolve_documents(["national_id", "Visa"], types) == ["Visa"]
