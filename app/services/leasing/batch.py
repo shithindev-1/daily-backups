@@ -126,7 +126,10 @@ async def process_batch(
     refnumber_folder = output_root() / safe_name(document_refnumber)
     refnumber_folder.mkdir(parents=True, exist_ok=True)
 
-    start_usage_tracking()
+    if not detected_types:
+        # The type-detection request started its own tally before its split calls; starting a new
+        # one here would wipe them.
+        start_usage_tracking()
 
     # One log line per stage: how long it took, and how far into the request it ended.
     stage_started = time.perf_counter()
@@ -184,8 +187,10 @@ async def process_batch(
                 document_type=validated.document_type,
                 started_at=started_at,
                 tenant_type=tenant_type,
-                # Detected types get the strict check below instead of the lenient one.
+                # Detected types get the strict check below instead of the lenient one, and are read
+                # with their type's own registry instruction.
                 check_type=not detected_types,
+                focused=detected_types,
             )
         except HTTPException as exc:
             # The pipeline turns a GeminiServiceError into HTTPException(502, "OCR provider unavailable").
@@ -276,7 +281,7 @@ async def process_batch(
                 sha256=document["sha256"],
                 settings=per_document_settings,
                 gemini_service=get_gemini_service(),
-                box_detection=not items[upload_indices[0]].get("precut"),
+                single_document=bool(items[upload_indices[0]].get("precut")),
             )
             if is_merged and saved_paths:
                 merged_pdf = await asyncio.to_thread(

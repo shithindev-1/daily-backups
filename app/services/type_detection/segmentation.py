@@ -45,6 +45,13 @@ _SEGMENT_PDF_DPI = 300
 _SIDE_ORDER = {"front": 0, "single": 1, "back": 2}
 # What replaces the part of a document that another document was lying on (light grey, BGR).
 COVER_FILL = (230, 230, 230)
+# Smallest share of the page a split region may cover: an ID card on an A4 scan is under 4% of it, so
+# the box call's 5% sanity limit would turn it into the whole page.
+_MIN_REGION_AREA_RATIO = 0.005
+# Margin kept around a cut-out on a page shared with other documents, as a share of its longest edge:
+# a split box placed right on a card's edge would otherwise cut the edge off. Other documents inside
+# the margin are painted out, and the final crop trims the cut-out to the document's own corners.
+_SHARED_PAGE_MARGIN_RATIO = 0.02
 # Two regions of the SAME document and side overlapping this much are one region reported twice.
 _DUPLICATE_OVERLAP = 0.8
 
@@ -80,11 +87,11 @@ def _region_label(region: dict[str, Any], page_number: int, position: int) -> st
         # No usable number: its own document, never merged into another.
         number = -(page_number * 1000 + position)
     side = str(region.get("side") or "single")
+    # Its own number is kept: it means the other side of the same card lies on top of this region.
     covered_by = []
     for value in region.get("covered_by") or []:
         try:
-            if int(value) != number:
-                covered_by.append(str(int(value)))
+            covered_by.append(str(int(value)))
         except (TypeError, ValueError):
             continue
     return f"{document_type}:{number}:{side if side in _SIDE_ORDER else 'single'}:{','.join(covered_by)}"
@@ -174,28 +181,45 @@ def _overlap(first: PageDetection, second: PageDetection) -> tuple[float, np.nda
 
 
 def _isolate(target: _Region, page_regions: list[_Region]) -> tuple[np.ndarray, float]:
-    """The page with every part of another document that overlaps `target` painted COVER_FILL, and
-    the share of `target` that was painted.
+    """The page with every other document painted COVER_FILL, and the share of `target` that was painted.
 
-    A shared part is painted unless `target` is the one lying on top (the other region lists it in
-    covered_by and is not itself listed by `target`) - when the model gives no order, painting is the
-    safe choice: the cut-out must never show a piece of another document.
+    Another document is painted wherever it lies - inside `target`'s outline and in the margin around
+    it - except where `target` lies on top of it (the other region lists it in covered_by and is not
+    itself listed by `target`): there `target`'s own pixels are kept. When the model gives no order,
+    painting the shared part is the safe choice: the cut-out must never show a piece of another document.
+
+    The two sides of one card (same document number, photographed separately) are handled the same
+    way: a side whose covered_by lists its own number has the other side lying on top of it, and
+    that part is painted; the side on top is left whole. A region that fell back to the whole page is
+    no real outline and paints nothing.
     """
     image = target.image
     painted = 0.0
+    target_quad = _quad(target.detection).astype(np.int32)
     for other in page_regions:
-        if other is target or other.number == target.number:
+        if other is target or other.detection.method.startswith("fallback"):
             continue
+        keep_shared_part = False
+        if other.number == target.number:
+            # The other side of the same card: its shared part is painted only when it lies on top.
+            keep_shared_part = (
+                other.side == target.side or target.number not in target.covered_by
+                or other.number in other.covered_by  # both claim to be covered - no usable order
+            )
+        else:
+            keep_shared_part = target.number in other.covered_by and other.number not in target.covered_by
         area, polygon = _overlap(target.detection, other.detection)
-        if polygon is None:
-            continue
-        target_on_top = target.number in other.covered_by and other.number not in target.covered_by
-        if target_on_top:
+        mask = np.zeros(target.image.shape[:2], dtype=np.uint8)
+        cv2.fillConvexPoly(mask, _quad(other.detection).astype(np.int32), 255)
+        if keep_shared_part:
+            cv2.fillConvexPoly(mask, target_quad, 0)
+        elif polygon is not None:
+            painted += area
+        if not mask.any():
             continue
         if image is target.image:
             image = target.image.copy()
-        cv2.fillConvexPoly(image, polygon.reshape(-1, 2).astype(np.int32), COVER_FILL)
-        painted += area
+        image[mask > 0] = COVER_FILL
     total = max(cv2.contourArea(_quad(target.detection)), 1.0)
     return image, min(painted / total, 1.0)
 
@@ -243,6 +267,7 @@ def build_segments(
                 ],
             },
             drop_duplicates=False,
+            min_area_ratio=_MIN_REGION_AREA_RATIO,
         )
         page_regions: list[_Region] = []
         for detection in detections:
@@ -282,7 +307,7 @@ def build_segments(
                 crops.append(crop_page(
                     isolated, region.detection,
                     padding=0 if shared_page else settings.detection_crop_padding_px,
-                    padding_ratio=0.0 if shared_page else settings.detection_crop_padding_ratio,
+                    padding_ratio=_SHARED_PAGE_MARGIN_RATIO if shared_page else settings.detection_crop_padding_ratio,
                     top_padding_ratio=0.0 if shared_page else settings.detection_crop_top_padding_ratio,
                 ))
                 segment.covered.append(round(covered, 3))

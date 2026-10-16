@@ -133,6 +133,40 @@ def test_page_detections_converts_normalized_fractions_to_pixels() -> None:
     assert detection.axis_aligned_bbox == [40, 30, 360, 270]
 
 
+def test_page_detections_reads_corners_on_the_0_to_1000_scale() -> None:
+    # A real answer (ID front and back scanned tilted on one A4 page): the model gave its corners on
+    # 0-1000 instead of fractions. Read as fractions they clamped to the page edge, both cards fell back
+    # to the full page and the back was then dropped as its "duplicate".
+    detections = page_detections(
+        page_number=1,
+        width=2481,
+        height=3508,
+        page_result={"found": True, "documents": [
+            {"label": "national id front", "corners": [
+                {"x": 235, "y": 204}, {"x": 816, "y": 167}, {"x": 786, "y": 344}, {"x": 172, "y": 361}]},
+            {"label": "national id back", "corners": [
+                {"x": 133, "y": 453}, {"x": 768, "y": 438}, {"x": 725, "y": 628}, {"x": 75, "y": 634}]},
+        ]},
+    )
+
+    assert [detection.method for detection in detections] == ["gemini_vision", "gemini_vision"]
+    assert detections[0].box == [[583, 716], [2024, 586], [1950, 1207], [427, 1266]]
+    assert detections[1].box == [[330, 1589], [1905, 1537], [1799, 2203], [186, 2224]]
+
+
+def test_page_detections_falls_back_on_pixel_corners() -> None:
+    # Pixel corners beyond 1000 are on an unknown image size, so they are not guessed at.
+    detections = page_detections(
+        page_number=1,
+        width=400,
+        height=300,
+        page_result={"found": True, "documents": [{"label": "card", "corners": _corners(100, 100, 1500, 1200)}]},
+    )
+
+    assert detections[0].method == "fallback_invalid_response"
+    assert detections[0].box == [[0, 0], [400, 0], [400, 300], [0, 300]]
+
+
 def test_page_detections_returns_one_detection_per_document_in_the_same_frame() -> None:
     detections = page_detections(
         page_number=1,
@@ -739,3 +773,56 @@ def test_run_detection_returns_none_and_writes_nothing_on_detector_failure(tmp_p
 
     assert result is None
     assert list(tmp_path.iterdir()) == []
+
+
+def test_corner_fractions_just_past_the_edge_are_still_fractions() -> None:
+    # The prompt asks for an uncertain corner slightly outside the edge, so 1.002 is a fraction.
+    detection = page_detections(
+        page_number=1,
+        width=1000,
+        height=1000,
+        page_result={"found": True, "documents": [{"label": "passport", "corners": [
+            {"x": 0.207, "y": 0.007}, {"x": 1.002, "y": 0.063}, {"x": 0.772, "y": 0.999}, {"x": 0.0, "y": 0.966}]}]},
+    )[0]
+
+    assert detection.method == "gemini_vision"
+    assert detection.box == [[207, 7], [1000, 63], [772, 999], [0, 966]]
+
+
+def test_split_regions_may_be_far_smaller_than_the_box_calls_minimum() -> None:
+    # One ID card on an A4 scan covers under 4% of it.
+    small = {"found": True, "documents": [{"label": "card", "corners": _corners(0.649, 0.239, 0.948, 0.365)}]}
+
+    assert page_detections(page_number=1, width=2337, height=3300, page_result=small)[0].method == "fallback_invalid_response"
+    assert page_detections(page_number=1, width=2337, height=3300, page_result=small,
+                           min_area_ratio=0.005)[0].method == "gemini_vision"
+
+
+@pytest.mark.parametrize(
+    ("documents", "expected"),
+    [
+        # The document fills most of the cut-out: its four corners are used.
+        ([{"label": "passport", "corners": _corners(0.05, 0.05, 0.95, 0.95)}], "gemini_vision"),
+        # Only a small box: a stray answer - the cut-out is taken whole.
+        ([{"label": "stamp", "corners": _corners(0.1, 0.1, 0.4, 0.4)}], "fallback_full_frame"),
+        # Nothing found: taken whole.
+        ([], "fallback_full_frame"),
+    ],
+)
+def test_a_cut_out_uses_only_one_document_that_fills_most_of_it(documents, expected) -> None:
+    from app.services.detection import _single_document
+
+    detections = page_detections(page_number=1, width=400, height=300,
+                                 page_result={"found": bool(documents), "documents": documents})
+    assert _single_document(detections, page_number=1, width=400, height=300).method == expected
+
+
+def test_a_cut_out_with_two_boxes_keeps_only_the_largest() -> None:
+    from app.services.detection import _single_document
+
+    detections = page_detections(page_number=1, width=400, height=300, page_result={"found": True, "documents": [
+        {"label": "edge of a neighbour", "corners": _corners(0.0, 0.0, 0.2, 0.3)},
+        {"label": "passport", "corners": _corners(0.1, 0.05, 0.95, 0.95)},
+    ]})
+    kept = _single_document(detections, page_number=1, width=400, height=300)
+    assert kept.label == "passport" and kept.region_number == 1

@@ -29,6 +29,7 @@ from app.services.gemini.prompts import (
     CROSS_VERIFICATION_PROMPT,
     DOCUMENT_TYPE_CLASSIFICATION_INSTRUCTION,
     EXTRACTION_PROMPT,
+    FOCUSED_EXTRACTION_PROMPT,
     ISSUES_SCHEMA,
     ORIENTATION_PROMPT,
     ORIENTATION_SCHEMA,
@@ -41,6 +42,7 @@ from app.services.gemini.prompts import (
     SHORT_SELF_MESSAGES,
     SYSTEM_INSTRUCTION,
     covered_parts_rules,
+    focused_system_instruction,
 )
 from app.services.gemini.usage import (
     CALL_CROP,
@@ -115,7 +117,7 @@ class GeminiService:
             api_key=settings.gemini_api_key,
             http_options=types.HttpOptions(timeout=settings.gemini_timeout_seconds * 1000),
         )
-        self._system_tokens: dict[str, int] = {}
+        self._system_tokens: dict[str, int | None] = {}
         self._system_tokens_lock = asyncio.Lock()
 
     @property
@@ -144,8 +146,10 @@ class GeminiService:
         # which is a reason to prefer Flash for this workload).
         defaults: dict[str, Any] = {
             "thinking_config": types.ThinkingConfig(thinking_budget=0),
-            "temperature": 0.0,
-            "seed": 0,
+            "temperature": self.settings.gemini_temperature,
+            "seed": self.settings.gemini_seed,
+            "top_p": self.settings.gemini_top_p,
+            "top_k": self.settings.gemini_top_k,
         }
         defaults.update(overrides)
         return types.GenerateContentConfig(**defaults)
@@ -170,9 +174,12 @@ class GeminiService:
                     ),
                 )
                 self._system_tokens[system_instruction] = with_system.total_tokens - baseline.total_tokens
-            except Exception:
-                logger.warning("Could not measure system instruction token count", exc_info=True)
-                return None
+            except Exception as exc:
+                # The Gemini Developer API does not count a system instruction; remember that, so the
+                # count is tried once per instruction instead of failing (and logging) on every call.
+                logger.info("System instruction token count not available (%s); token-breakdown.log "
+                            "leaves it empty", type(exc).__name__)
+                self._system_tokens[system_instruction] = None
             return self._system_tokens[system_instruction]
 
     @staticmethod
@@ -279,12 +286,19 @@ class GeminiService:
         document_name: str,
         document_type: str,
         tenant_type: str | None = None,
+        focused: bool = False,
     ) -> dict[str, Any]:
         started_at = time.perf_counter()
         hit_id = uuid.uuid4().hex[:12]
-        # A company tenant is read with its own field rules and field list; everything else -
-        # security rules, side and document-type observations, output format - is shared.
-        if is_company(tenant_type):
+        # `focused` (type-detection endpoints): read with the document type's own instruction and
+        # fields from the registry. Otherwise - and for a type without an entry - the general
+        # instruction: a company tenant with its own field rules and list, everything else shared.
+        prompt_text = EXTRACTION_PROMPT
+        focused_setup = focused_system_instruction(document_type, is_company(tenant_type)) if focused else None
+        if focused_setup is not None:
+            system_instruction, fields = focused_setup
+            prompt_text = FOCUSED_EXTRACTION_PROMPT
+        elif is_company(tenant_type):
             system_instruction, fields = COMPANY_SYSTEM_INSTRUCTION, COMPANY_EXTRACTION_FIELDS
         else:
             system_instruction, fields = SYSTEM_INSTRUCTION, INDIVIDUAL_EXTRACTION_FIELDS
@@ -298,8 +312,8 @@ class GeminiService:
         # The type stays a parameter because the caller's selection is what the response is later
         # validated against; document_name is a free-typed display string the caller controls (it
         # could just as easily read "Passport" while a national ID is uploaded), so classification
-        # must never be able to see it, only the file's own pixels.
-        prompt_text = EXTRACTION_PROMPT
+        # must never be able to see it, only the file's own pixels. (A focused reading, on the
+        # type-detection endpoints, is told the split step's type - see FOCUSED_EXTRACTION_PROMPT.)
         message_content = [
             types.Part.from_bytes(data=content, mime_type=media_type),
             types.Part.from_text(text=prompt_text),

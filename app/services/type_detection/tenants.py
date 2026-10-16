@@ -29,6 +29,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Hashable
 
+from app.services.document_registry import link_numbers
 from app.services.form_normalization import format_date
 from app.services.names import name_tokens, same_name
 
@@ -38,8 +39,6 @@ COMPANY_TYPE = "trade_license"
 # list, never on the tenant fields.
 LICENCE_TYPES = frozenset({"trade_license", "initial_approval"})
 
-_INDIVIDUAL_IDS = ("National_Id", "Passport_Number", "Visa_Number")
-_SIGNATORY_IDS = ("Signatory_National_Id", "Signatory_Passport_Number", "Signatory_Visa_Number")
 _MEMBER = re.compile(r"^\s*(?P<name>[^()]+?)\s*(?:\([^()]*\))?\s*$")
 
 
@@ -106,11 +105,11 @@ class _Person:
 def _person_details(unit: Unit, company: bool) -> tuple[set[str], str | None, str | None]:
     data = unit.data
     if company:
-        ids = {_id(data.get(name)) for name in _SIGNATORY_IDS}
+        ids = {_id(data.get(name)) for name in link_numbers(unit.document_type, company=True)}
         name = data.get("Signatory_Name_En") or data.get("Holder_Name")
         birth = None
     else:
-        ids = {_id(data.get(name)) for name in _INDIVIDUAL_IDS}
+        ids = {_id(data.get(name)) for name in link_numbers(unit.document_type, company=False)}
         name, birth = data.get("Tenant_Name_En"), _birth(data.get("Date_Of_Birth"))
     return {value for value in ids if value}, name, birth
 
@@ -141,7 +140,7 @@ def _identity(unit: Unit, company: bool) -> tuple[set[str], str | None]:
     """What a supporting document is matched on: the company's licence or approval number and name
     for a company, the person's ID numbers and name for an individual."""
     if company:
-        numbers = {_id(unit.data.get(field)) for field in ("Trade_License_Number", "Initial_Approval_Number")}
+        numbers = {_id(unit.data.get(field)) for field in link_numbers(unit.document_type, company=True)}
         return {number for number in numbers if number}, unit.data.get("Company_Name_En")
     ids, name, _ = _person_details(unit, company=False)
     return ids, name

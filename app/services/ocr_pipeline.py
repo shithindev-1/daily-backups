@@ -156,6 +156,24 @@ def merge_extracted_data(documents: list[dict[str, Any]], fields: list[str] | No
     return merged
 
 
+# Fields that name a place or nationality: a value with no letter at all ("3", an office code) is
+# never one, so a focused reading drops it rather than return it.
+PLACE_FIELDS = frozenset({
+    "Nationality", "Passport_Issuing_Location", "Signatory_Passport_Issuing_Location",
+    "Home_Country", "Home_State_Emirates", "Home_City", "Home_Subdivision_Location",
+    "Resident_Country", "Resident_State_Emirates", "Resident_City", "Resident_Subdivision_Location",
+})
+
+
+def drop_numeric_places(data: dict[str, Any]) -> dict[str, Any]:
+    """`data` with any place field that holds no letter set to None."""
+    return {
+        field: None if field in PLACE_FIELDS and value is not None and not any(ch.isalpha() for ch in str(value))
+        else value
+        for field, value in data.items()
+    }
+
+
 async def extract_and_type_check(
     *,
     request_id: str,
@@ -169,8 +187,11 @@ async def extract_and_type_check(
     started_at: float,
     tenant_type: str | None = None,
     check_type: bool = True,
+    focused: bool = False,
 ) -> dict[str, Any]:
     """Extraction plus the type-match check - shared by a real upload and a synthetic merged file.
+
+    `focused` reads the document with its type's own registry instruction (type-detection endpoints).
 
     `check_type=False` skips the type-match check, for a caller that makes its own from the
     returned `types_present`.
@@ -186,6 +207,9 @@ async def extract_and_type_check(
     # The tenant type picks a different prompt and field list, so it is part of the key: a company
     # reading of a file is never handed to an individual request for the same file, or back.
     cache_key = ("extraction", settings.gemini_model, "company" if is_company(tenant_type) else "individual", sha256)
+    if focused:
+        # A focused reading depends on the type it was told, so the type is part of its key.
+        cache_key = cache_key + ("focused", document_type)
     raw_response = result_cache.get(cache_key)
     if raw_response is not None:
         logger.info(
@@ -200,6 +224,8 @@ async def extract_and_type_check(
                 document_name=document_name,
                 document_type=document_type,
                 tenant_type=tenant_type,
+                # Only passed when set, so the general endpoints' call is unchanged.
+                **({"focused": True} if focused else {}),
             )
         except GeminiServiceError as exc:
             del content
@@ -231,10 +257,13 @@ async def extract_and_type_check(
             default_reference_id=request_id,
         ))
 
+    data = raw_response.get("data") or {}
+    if focused:
+        data = drop_numeric_places(data)
     return {
         "document_name": document_name,
         "document_type": document_type,
-        "data": raw_response.get("data") or {},
+        "data": data,
         "content": content,
         "mime_type": mime_type,
         "sha256": sha256,

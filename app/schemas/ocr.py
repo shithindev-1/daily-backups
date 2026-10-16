@@ -169,10 +169,6 @@ COMPANY_MISSING_INFO_FIELDS = [field.lower() for field in COMPANY_DATA_FIELDS]
 COMPANY_INTERNAL_FIELDS = ["License_Members", "Holder_Name"]
 # An initial approval certificate's own details - kept apart from the trade licence's. Read for every
 # company request, returned only by the type-detection endpoints (the /ocr/leasing response is unchanged).
-# The tenant's own contact details - for a company, the company tenant's. Read for every request,
-# returned only by the type-detection endpoints (the /ocr and /ocr/leasing responses are unchanged).
-TENANT_CONTACT_FIELDS = ["Tenant_Mobile_Number", "Tenant_Email"]
-
 INITIAL_APPROVAL_FIELDS = [
     "Initial_Approval_Number",
     "Initial_Approval_Issue_Date",
@@ -181,12 +177,9 @@ INITIAL_APPROVAL_FIELDS = [
 ]
 # What the company extraction prompt asks for: the output fields, the initial approval's own fields,
 # and the internal ones.
-COMPANY_EXTRACTION_FIELDS = (
-    COMPANY_DATA_FIELDS + INITIAL_APPROVAL_FIELDS + TENANT_CONTACT_FIELDS + COMPANY_INTERNAL_FIELDS
-)
-# A company's form_data on the type-detection endpoints: the trade licence fields, the initial
-# approval's, and the tenant's contact details.
-DETECT_COMPANY_DATA_FIELDS = COMPANY_DATA_FIELDS + INITIAL_APPROVAL_FIELDS + TENANT_CONTACT_FIELDS
+COMPANY_EXTRACTION_FIELDS = COMPANY_DATA_FIELDS + INITIAL_APPROVAL_FIELDS + COMPANY_INTERNAL_FIELDS
+# A company's form_data on the type-detection endpoints: the trade licence fields plus the initial approval's.
+DETECT_COMPANY_DATA_FIELDS = COMPANY_DATA_FIELDS + INITIAL_APPROVAL_FIELDS
 DETECT_COMPANY_MISSING_INFO_FIELDS = [field.lower() for field in DETECT_COMPANY_DATA_FIELDS]
 
 # Read from an individual's documents for matching only - never returned in form_data or missing.
@@ -194,10 +187,7 @@ DETECT_COMPANY_MISSING_INFO_FIELDS = [field.lower() for field in DETECT_COMPANY_
 # accepted only when it lists the tenant.
 INDIVIDUAL_INTERNAL_FIELDS = ["License_Members"]
 # What the individual extraction prompt asks for: the output fields plus the internal ones.
-INDIVIDUAL_EXTRACTION_FIELDS = DATA_FIELDS + TENANT_CONTACT_FIELDS + INDIVIDUAL_INTERNAL_FIELDS
-# An individual's form_data on the type-detection endpoints: the usual fields plus contact details.
-DETECT_INDIVIDUAL_DATA_FIELDS = DATA_FIELDS + TENANT_CONTACT_FIELDS
-DETECT_INDIVIDUAL_MISSING_INFO_FIELDS = [field.lower() for field in DETECT_INDIVIDUAL_DATA_FIELDS]
+INDIVIDUAL_EXTRACTION_FIELDS = DATA_FIELDS + INDIVIDUAL_INTERNAL_FIELDS
 
 TENANT_TYPE_COMPANY = "company"
 # The one document a company submission cannot go without.
@@ -220,11 +210,11 @@ def fields_for_tenant_type(tenant_type: str | None) -> tuple[list[str], list[str
 
 
 def detect_fields_for_tenant_type(tenant_type: str | None) -> tuple[list[str], list[str]]:
-    """Like `fields_for_tenant_type`, for the type-detection endpoints: both tenant types also get
-    the tenant's mobile number and email, and a company the initial approval's own keys."""
+    """Like `fields_for_tenant_type`, for the type-detection endpoints: a company also gets the
+    initial approval's own keys."""
     if is_company(tenant_type):
         return DETECT_COMPANY_DATA_FIELDS, DETECT_COMPANY_MISSING_INFO_FIELDS
-    return DETECT_INDIVIDUAL_DATA_FIELDS, DETECT_INDIVIDUAL_MISSING_INFO_FIELDS
+    return DATA_FIELDS, MISSING_INFO_FIELDS
 
 
 class OcrData(BaseModel):
