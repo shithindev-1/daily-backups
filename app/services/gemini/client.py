@@ -150,6 +150,9 @@ class GeminiService:
             "seed": self.settings.gemini_seed,
             "top_p": self.settings.gemini_top_p,
             "top_k": self.settings.gemini_top_k,
+            # No call here gives the model tools to call. Saying so explicitly also stops the SDK's
+            # "automatic function calling (AFC)" notice, which it prints on every call otherwise.
+            "automatic_function_calling": types.AutomaticFunctionCallingConfig(disable=True),
         }
         defaults.update(overrides)
         return types.GenerateContentConfig(**defaults)

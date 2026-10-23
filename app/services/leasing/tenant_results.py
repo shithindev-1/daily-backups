@@ -28,6 +28,7 @@ from app.services.ocr_pipeline import (
 from app.services.post_processing import document_label
 from app.services.type_detection.tenants import (
     LICENCE_TYPES,
+    RENTAL_INDEX_TYPE,
     Tenant,
     Unit,
     group_companies,
@@ -58,6 +59,12 @@ def _unmatched_message(unit: Unit, name: str, company: bool, *, several: bool) -
     label, e.g. "Ejari certificate 2") says which document; the fix names its plain type."""
     whom = "any tenant in this request" if several else "the tenant"
     kind = document_label(unit.document_type)
+    if unit.document_type == RENTAL_INDEX_TYPE:
+        if has_link_details(unit, company):
+            owner = "any tenant's" if several else ("the company's" if company else "the tenant's")
+            return (f"'{name}' doesn't match the property on {owner} Ejari certificate or tenancy contract. "
+                    "Please upload the matching Ejari certificate or tenancy contract, or remove it.")
+        return f"We couldn't read the property on '{name}'. Please upload a clearer copy."
     if company:
         if has_link_details(unit, company):
             return (f"'{name}' is not for the company on the trade licence or initial approval. "
@@ -73,6 +80,33 @@ def _unmatched_message(unit: Unit, name: str, company: bool, *, several: bool) -
         return f"'{name}' doesn't mention {whom}. Please upload the tenant's own {kind}, or remove it."
     return f"We couldn't confirm that '{name}' belongs to {whom}. Please upload a clearer copy."
 
+
+
+def _card_aliases(documents: list[dict[str, Any]], own: dict[str, int], types: dict[str, str]) -> dict[str, str]:
+    """Makes each front/back pair sent as two files ONE card in `own` and `types` (changed in place),
+    and returns the names the model may use for it -> its label.
+
+    The two sides are labelled "National ID 1" and "National ID 2" and the model sees the card as
+    "National ID 1 + National ID 2"; it may answer with that, either side, or just "National ID". The
+    card is named "National ID" when it is the tenant's only one of its type, otherwise by its front."""
+    aliases: dict[str, str] = {}
+    for document in documents:
+        if not document.get("is_merged_pair"):
+            continue
+        front, _, back = document["document_name"].partition(" + ")
+        if front not in own:
+            continue
+        index, document_type = own.pop(front), types.pop(front)
+        own.pop(back, None)
+        types.pop(back, None)
+        plain = document_label(document_type)
+        plain = plain[:1].upper() + plain[1:]
+        label = plain if document_type not in types.values() and plain not in own else front
+        own[label], types[label] = index, document_type
+        # The plain type name stands for this card only when it is the tenant's one card of that type.
+        for name in (document["document_name"], front, back) + ((plain,) if label == plain else ()):
+            aliases[name.lower()] = label
+    return aliases
 
 async def finish_per_tenant(
     *, tenant_type: str, request_id: str, items: list[dict[str, Any]], candidates: list[dict[str, Any]],
@@ -182,7 +216,8 @@ async def finish_per_tenant(
         return sorted(documents, key=lambda document: _VALUE_PRIORITY.get(document["document_type"], len(_VALUE_PRIORITY)))
 
     async def cross_check(tenant: Tenant) -> None:
-        documents = own_documents(tenant)
+        # A rental index describes a property, not a person: there is nothing on it to compare.
+        documents = [document for document in own_documents(tenant) if document["document_type"] != RENTAL_INDEX_TYPE]
         if has_errors(tenant) or len(documents) < 2 or not settings.validation_enabled:
             return
         try:
@@ -193,10 +228,11 @@ async def finish_per_tenant(
             issues = [CROSS_VERIFICATION_UNAVAILABLE]
         own = {items[index]["document_name"]: index for index in indices(tenant)}
         types = {name: items[index]["document_type"] for name, index in own.items()}
+        aliases = _card_aliases(documents, own, types)
         for issue in issues:
             if isinstance(issue, dict):
                 # A structured conflict: each involved document gets its own message.
-                named = resolve_documents(issue.get("documents") or [], types)
+                named = resolve_documents(issue.get("documents") or [], types, aliases)
                 if not named:
                     named = list(own)  # never drop a finding: it lands on every document
                 for label in named:
@@ -245,9 +281,11 @@ async def finish_per_tenant(
         normalize_form_data(data)
         tenants.append({"tenant_id": tenant_id, "status": "success", "form_data": data})
 
+    # Every front/back pair read as one card is one entry - also one that failed, so its message
+    # is shown once, and a pair failed by a later check keeps that check's message.
     merged_pairs = [
         (*merged_indices(document, index_by_name), document["document_type"])
-        for document in extracted if document.get("is_merged_pair")
+        for document in resolved if document.get("is_merged_pair")
     ]
     status = "success" if tenants and not any(report["error"] for report in documents_report) else "failed"
     logger.info(

@@ -10,11 +10,21 @@ The old endpoints (`/ocr`, `/ocr/leasing`) keep the general instruction - see ge
 
 from dataclasses import dataclass
 
+from app.schemas.ocr import PROPERTY_FIELDS
+
 # --- field definitions, reused by every entry that reads the field -------------------------------
 
 _HOLDER = "the document's own holder"
 
 INDIVIDUAL_FIELD_RULES: dict[str, str] = {
+    "Property_Area": "Property_Area is the area or community the rented property is in (for example Al Barsha 1, "
+                     "Dubai Marina), exactly as printed.",
+    "Property_Building": "Property_Building is the rented property's building or project name, exactly as printed.",
+    "Property_Plot_Number": "Property_Plot_Number is the property's plot or land number, exactly as printed.",
+    "Property_Unit_Number": "Property_Unit_Number is the rented unit's own number (flat, villa or office number), "
+                            "exactly as printed - never a plot, makani or contract number.",
+    "Property_Contract_Number": "Property_Contract_Number is the Ejari or tenancy contract number the document "
+                                "prints for this tenancy, exactly as printed.",
     "Tenant_Name_En": f"Tenant_Name_En is the full name of {_HOLDER} in English, as printed.",
     "Tenant_Name_Ar": f"Tenant_Name_Ar is the full name of {_HOLDER} in Arabic, as printed.",
     "Date_Of_Birth": f"Date_Of_Birth is the date of birth of {_HOLDER}.",
@@ -31,8 +41,10 @@ INDIVIDUAL_FIELD_RULES: dict[str, str] = {
     "National_Id_Expiry": "National_Id_Expiry is the national identity card's own expiry date.",
     "Passport_Number": "Passport_Number is the passport's own number (on a visa: the passport number it prints).",
     "Passport_Issuing_Location": (
-        "Passport_Issuing_Location is the PLACE where the passport was issued - a city, emirate or country name "
-        "printed with a label such as Place of Issue or Issuing Authority. An issuing office number or code (for "
+        "Passport_Issuing_Location is read only from a passport: the PLACE where it was issued - a city, emirate or "
+        "country name printed with a label such as Place of Issue or Issuing Authority. Copy it exactly as printed; "
+        "when it is printed only in another language or script (such as Arabic), give its English name instead "
+        "(for example \"الشارقة\" -> \"Sharjah\"). An issuing office number or code (for "
         "example \"Issuing Office: 3\") is never a place: when no place name is printed, it is null."
     ),
     "Passport_Expiry": "Passport_Expiry is the passport's own expiry date.",
@@ -69,6 +81,14 @@ _ADDRESS_RULE = (
 )
 
 COMPANY_FIELD_RULES: dict[str, str] = {
+    "Property_Area": "Property_Area is the area or community the rented property is in (for example Al Barsha 1, "
+                     "Dubai Marina), exactly as printed.",
+    "Property_Building": "Property_Building is the rented property's building or project name, exactly as printed.",
+    "Property_Plot_Number": "Property_Plot_Number is the property's plot or land number, exactly as printed.",
+    "Property_Unit_Number": "Property_Unit_Number is the rented unit's own number (flat, villa or office number), "
+                            "exactly as printed - never a plot, makani or contract number.",
+    "Property_Contract_Number": "Property_Contract_Number is the Ejari or tenancy contract number the document "
+                                "prints for this tenancy, exactly as printed.",
     "Company_Name_En": "Company_Name_En is the company's registered name in English, as printed.",
     "Company_Name_Ar": "Company_Name_Ar is the company's registered name in Arabic, as printed.",
     "Trade_License_Number": (
@@ -95,8 +115,10 @@ COMPANY_FIELD_RULES: dict[str, str] = {
     "Signatory_National_Id_Expiry": "Signatory_National_Id_Expiry is the national identity card's own expiry date.",
     "Signatory_Passport_Number": "Signatory_Passport_Number is the passport's own number.",
     "Signatory_Passport_Issuing_Location": (
-        "Signatory_Passport_Issuing_Location is the PLACE where the passport was issued - a city, emirate or country "
-        "name printed as its place of issue; an issuing office number or code is never a place, so then it is null."
+        "Signatory_Passport_Issuing_Location is read only from the signatory's passport: the PLACE where it was "
+        "issued - a city, emirate or country name printed as its place of issue. Copy it exactly as printed; when it "
+        "is printed only in another language or script (such as Arabic), give its English name instead (for example "
+        "\"الشارقة\" -> \"Sharjah\"). An issuing office number or code is never a place, so then it is null."
     ),
     "Signatory_Passport_Expiry": "Signatory_Passport_Expiry is the passport's own expiry date.",
     "Signatory_Visa_Number": (
@@ -140,6 +162,7 @@ class DocumentSpec:
 _PERSON = ("Tenant_Name_En", "Tenant_Name_Ar", "Date_Of_Birth", "Nationality", "Gender")
 _SIGNATORY_IDS = ("Signatory_National_Id", "Signatory_Passport_Number", "Signatory_Visa_Number")
 _COMPANY_IDS = ("Trade_License_Number", "Initial_Approval_Number")
+_PROPERTY = tuple(PROPERTY_FIELDS)
 
 REGISTRY: dict[str, DocumentSpec] = {spec.document_type: spec for spec in (
     DocumentSpec(
@@ -151,7 +174,7 @@ REGISTRY: dict[str, DocumentSpec] = {spec.document_type: spec for spec in (
         ("Signatory_Name_En", "Signatory_Name_Ar", "Signatory_Designation", "Signatory_National_Id",
          "Signatory_National_Id_Expiry", "Holder_Name"),
         "the ID number, the holder's name, date of birth, nationality and the expiry date on the front; "
-        "the card number on the back",
+        "the card number and the lines of letters and numbers at the bottom of the back",
         individual_links=("National_Id",), company_links=("Signatory_National_Id",),
     ),
     DocumentSpec(
@@ -204,8 +227,8 @@ REGISTRY: dict[str, DocumentSpec] = {spec.document_type: spec for spec in (
         "an Ejari tenancy registration certificate. Read the TENANT's details only - never the owner's, the "
         "property manager's or the landlord's.",
         ("Tenant_Name_En", "Tenant_Name_Ar", "Nationality", "National_Id", "Passport_Number", "Visa_Number")
-        + _ADDRESS_FIELDS,
-        ("Company_Name_En", "Company_Name_Ar", "Trade_License_Number"),
+        + _ADDRESS_FIELDS + _PROPERTY,
+        ("Company_Name_En", "Company_Name_Ar", "Trade_License_Number") + _PROPERTY,
         "the contract number, the tenant's name and the contract start and end dates",
         individual_links=("National_Id", "Passport_Number", "Visa_Number"), company_links=_COMPANY_IDS,
     ),
@@ -213,8 +236,8 @@ REGISTRY: dict[str, DocumentSpec] = {spec.document_type: spec for spec in (
         "tenancy_contract", "tenancy contract",
         "a tenancy or rental contract. Read the TENANT's details only - never the landlord's, owner's or agent's.",
         ("Tenant_Name_En", "Tenant_Name_Ar", "Nationality", "National_Id", "Passport_Number", "Visa_Number")
-        + _ADDRESS_FIELDS,
-        ("Company_Name_En", "Company_Name_Ar", "Trade_License_Number"),
+        + _ADDRESS_FIELDS + _PROPERTY,
+        ("Company_Name_En", "Company_Name_Ar", "Trade_License_Number") + _PROPERTY,
         "the tenant's name, the property and the contract start and end dates",
         individual_links=("National_Id", "Passport_Number", "Visa_Number"), company_links=_COMPANY_IDS,
     ),
@@ -244,6 +267,15 @@ REGISTRY: dict[str, DocumentSpec] = {spec.document_type: spec for spec in (
         ("Tenant_Name_En", "Tenant_Name_Ar") + _ADDRESS_FIELDS,
         ("Company_Name_En", "Company_Name_Ar"),
         "the account holder's name, the account number and the statement period",
+    ),
+    DocumentSpec(
+        "rental_index", "rental index",
+        "a rental index result or certificate from the Dubai Land Department (RERA): it gives the rent range for "
+        "a property and describes the property, not a person. In Document_Types_Present, report this document as "
+        "rental_index.",
+        _PROPERTY,
+        _PROPERTY,
+        "the area, the property type and the rent range",
     ),
     DocumentSpec(
         "cheque", "cheque",
@@ -295,6 +327,24 @@ def link_numbers(document_type: str, company: bool) -> tuple[str, ...]:
     if entry is None:
         return _SIGNATORY_IDS if company else ("National_Id", "Passport_Number", "Visa_Number")
     return entry.company_links if company else entry.individual_links
+
+
+# The number a document of this type always prints for itself. A focused reading that misses it (or
+# reads nothing at all) is read once more with the general instruction - see ocr_pipeline.
+_OWN_NUMBERS = {
+    "national_id": ("National_Id", "Signatory_National_Id"),
+    "passport": ("Passport_Number", "Signatory_Passport_Number"),
+    "visa": ("Visa_Number", "Signatory_Visa_Number"),
+    "trade_license": ("Trade_License_Number",),
+    "initial_approval": ("Initial_Approval_Number",),
+}
+
+
+def own_numbers(document_type: str, company: bool) -> tuple[str, ...]:
+    """The fields holding the document's own number, among the fields it is read with (none for a
+    type without one, such as a cheque, or a licence read for an individual)."""
+    fields = extraction_fields(document_type, company) or []
+    return tuple(field for field in _OWN_NUMBERS.get(document_type, ()) if field in fields)
 
 
 def _article(label: str) -> str:

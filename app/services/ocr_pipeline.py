@@ -21,19 +21,24 @@ from pypdf import PdfReader, PdfWriter
 from app.core.config import settings
 from app.core.exceptions import ValidationStopped
 from app.schemas.ocr import (
+    COMPANY_EXTRACTION_FIELDS,
     DATA_FIELDS,
     FRONT_BACK_TYPES,
+    INDIVIDUAL_EXTRACTION_FIELDS,
     MISSING_INFO_FIELDS,
     ErrorInfo,
     OcrResponse,
     is_company,
 )
-from app.services import result_cache
+from app.services import document_registry, result_cache
 from app.services.detection import run_detection, save_merged_document
 from app.services.gemini import (
     GeminiServiceError,
+    charged_to,
+    documents_named,
     get_gemini_service,
     log_usage_summary,
+    usage_for,
 )
 from app.services.post_processing import (
     ambiguous_pair_response,
@@ -79,6 +84,8 @@ async def call_with_one_retry(call: Any, *, what: str, request_id: str) -> Any:
         raise VerificationUnavailable(what) from exc
 
 
+@charged_to(lambda **kw: [d for document in kw["documents"]
+                 for d in documents_named(document["document_name"], document["document_type"])])
 async def verify_documents_across(
     *, request_id: str, documents: list[dict[str, Any]], tenant_type: str | None = None,
     short_messages: bool = False,
@@ -150,10 +157,25 @@ def merge_extracted_data(documents: list[dict[str, Any]], fields: list[str] | No
     # the individual list, as the /ocr endpoint has always used.
     merged: dict[str, Any] = dict.fromkeys(fields or DATA_FIELDS)
     for document in documents:
+        from_passport = _shows_passport(document)
         for field, value in document["data"].items():
+            if field in PASSPORT_ONLY_FIELDS and not from_passport:
+                continue
             if merged.get(field) is None and value is not None:
                 merged[field] = value
     return merged
+
+
+# Read only from a passport: a visa, ID or contract may print a place of issue of its own.
+PASSPORT_ONLY_FIELDS = frozenset({"Passport_Issuing_Location", "Signatory_Passport_Issuing_Location"})
+
+
+def _shows_passport(document: dict[str, Any]) -> bool:
+    """The document is a passport, or a file its extraction says shows one. A document carrying
+    neither key (a merged front/back pair is built from two that do) is not restricted."""
+    if "document_type" not in document and "types_present" not in document:
+        return True
+    return document.get("document_type") == "passport" or "passport" in (document.get("types_present") or [])
 
 
 # Fields that name a place or nationality: a value with no letter at all ("3", an office code) is
@@ -174,6 +196,55 @@ def drop_numeric_places(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _needs_general_reading(
+    document_type: str, tenant_type: str | None, data: dict[str, Any], raw_response: dict[str, Any],
+) -> bool:
+    """A focused reading is a safety risk when it read nothing at all, or missed the document's own
+    number (an ID's ID number, a passport's passport number, ...) - except on the back of a National
+    ID shown alone, which need not print it."""
+    fields = document_registry.extraction_fields(document_type, is_company(tenant_type))
+    if fields is None:
+        return False  # not a registry type: it was already read with the general instruction
+    general = COMPANY_EXTRACTION_FIELDS if is_company(tenant_type) else INDIVIDUAL_EXTRACTION_FIELDS
+    if not set(fields) & set(general):
+        return False  # nothing the general instruction reads (a rental index's property details)
+    if not any(value is not None for value in data.values()):
+        return True
+    numbers = document_registry.own_numbers(document_type, is_company(tenant_type))
+    if not numbers or any(data.get(field) is not None for field in numbers):
+        return False
+    back_only = document_type in FRONT_BACK_TYPES and not raw_response.get("frontVisible", True)
+    return not back_only
+
+
+async def _fill_from_general_reading(data: dict[str, Any], **reading: Any) -> dict[str, Any]:
+    """The focused reading with its empty fields filled from a reading with the general instruction -
+    the one the older endpoints use - so a focused reading is never poorer than that. Only the type's
+    own fields are filled; if the second reading fails, the focused reading is kept as it is."""
+    try:
+        general = await extract_and_type_check(**reading, check_type=False, focused=False)
+    except HTTPException:
+        logger.warning(
+            "Focused reading kept without second reading request_id=%s document=%s reason=general_reading_failed",
+            reading["request_id"], reading["position"],
+        )
+        return data
+    general_data = drop_numeric_places(general["data"])
+    own_fields = set(
+        document_registry.extraction_fields(reading["document_type"], is_company(reading["tenant_type"])) or data
+    )
+    filled = [
+        field for field, value in data.items()
+        if field in own_fields and value is None and general_data.get(field) is not None
+    ]
+    logger.info(
+        "Focused reading completed by a general reading request_id=%s document=%s type=%s filled=%d",
+        reading["request_id"], reading["position"], reading["document_type"], len(filled),
+    )
+    return {field: general_data[field] if field in filled else value for field, value in data.items()}
+
+
+@charged_to(lambda **kw: documents_named(kw["document_name"], kw["document_type"]))
 async def extract_and_type_check(
     *,
     request_id: str,
@@ -260,6 +331,12 @@ async def extract_and_type_check(
     data = raw_response.get("data") or {}
     if focused:
         data = drop_numeric_places(data)
+        if _needs_general_reading(document_type, tenant_type, data, raw_response):
+            data = await _fill_from_general_reading(
+                data, request_id=request_id, position=position, content=content, filename=filename,
+                mime_type=mime_type, sha256=sha256, document_name=document_name,
+                document_type=document_type, started_at=started_at, tenant_type=tenant_type,
+            )
     return {
         "document_name": document_name,
         "document_type": document_type,
@@ -357,6 +434,8 @@ def _build_merged_pdf(first_content: bytes, first_mime: str, second_content: byt
     return output.getvalue()
 
 
+@charged_to(lambda **kw: documents_named(kw["front"]["document_name"], kw["document_type"])
+    + documents_named(kw["back"]["document_name"], kw["document_type"]))
 async def _merge_front_back(
     *,
     request_id: str,
@@ -519,6 +598,7 @@ async def resolve_incomplete_pairs(
     return resolved
 
 
+@charged_to(lambda **kw: documents_named(kw["document"]["document_name"], kw["document"]["document_type"]))
 async def run_self_verification(
     *,
     request_id: str,
@@ -679,27 +759,28 @@ async def run_ocr_batch(
     # for nothing.
     if detection_enabled:
         for document in extracted:
-            saved_paths = await run_detection(
-                content=document["content"],
-                filename=document["filename"],
-                mime_type=document["mime_type"],
-                document_type=document["document_type"],
-                sha256=document["sha256"],
-                settings=settings,
-                gemini_service=get_gemini_service(),
-            )
-            if document.get("is_merged_pair") and saved_paths:
-                # The crop pipeline above already produced one clean, upright PNG per side of this
-                # merged document; stitch those into the one combined file the person who uploaded
-                # the two separate sides actually wants to download, next to the crop output on
-                # disk, found by its `_merged.pdf` suffix.
-                await asyncio.to_thread(
-                    save_merged_document,
-                    saved_paths,
-                    output_dir=Path(settings.detection_output_dir),
+            with usage_for(*documents_named(document["document_name"], document["document_type"])):
+                saved_paths = await run_detection(
+                    content=document["content"],
                     filename=document["filename"],
+                    mime_type=document["mime_type"],
+                    document_type=document["document_type"],
                     sha256=document["sha256"],
+                    settings=settings,
+                    gemini_service=get_gemini_service(),
                 )
+                if document.get("is_merged_pair") and saved_paths:
+                    # The crop pipeline above already produced one clean, upright PNG per side of this
+                    # merged document; stitch those into the one combined file the person who uploaded
+                    # the two separate sides actually wants to download, next to the crop output on
+                    # disk, found by its `_merged.pdf` suffix.
+                    await asyncio.to_thread(
+                        save_merged_document,
+                        saved_paths,
+                        output_dir=Path(settings.detection_output_dir),
+                        filename=document["filename"],
+                        sha256=document["sha256"],
+                    )
     else:
         logger.info(
             "Detection pipeline skipped request_id=%s reason=disabled (extraction only) documents=%d",

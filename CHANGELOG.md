@@ -5,6 +5,63 @@ major version means a change that existing callers must adapt to.
 
 ## Unreleased
 
+### Added (logs only - responses and existing logs unchanged)
+- **`logs/document-usage.log`**: one JSON line per document per request, with its `document_type` and its tokens
+  per call type (`segmentation`, `extraction`, `validation`, `crop`, `rotation`) and `document_total`, so the cost of
+  each document type can be estimated. A call made for one document is charged to it; a file's split call, a
+  cross-check or a front/back check is shared equally among the documents involved, so a request's lines add up
+  to its `usage.log` line (within rounding). All endpoints.
+
+### Added (type-detection endpoints - tell the .NET team)
+- **Rental index** (Dubai Land Department / RERA rental index result) is a supported document type:
+  `document_type: "rental_index"`, checked, cropped (`Tenant_1_Rental_Index.pdf`). It adds no form_data keys. It
+  names no person, so it must match the tenant's **Ejari certificate or tenancy contract by property** - the same
+  contract or plot number, building or area - otherwise it gets "'Rental index' doesn't match the property on the
+  tenant's Ejari certificate or tenancy contract. ...". The property details are read for that match only and
+  never returned. The older endpoints are unchanged. Its contract end date (the tenancy's, normally past at
+  renewal) is never reported as an expiry.
+
+### Changed (type-detection endpoints - tell the .NET team)
+- **An unsupported document is now an error, naming what it is.** A document outside the 11 types (a utility
+  bill, a driving licence, ...) used to come back `ignored` with no message; now it is `invalid` with
+  e.g. "The DEWA utility bill in 'bill.png' is not listed." ("found on page 2 of '<file>'" when the file holds
+  other documents). It is never read; the request is `failed`, the tenant's own
+  documents are still checked and extracted (`form_data[].status` per tenant).
+
+### Fixed (type-detection endpoints)
+- **False "date of birth does not match the back"** on an ID: the self-check misread the machine-readable date
+  (YYMMDD, 710504) against the printed one (04/05/1971). It now compares calendar dates, not formats.
+
+### Maintenance (all endpoints)
+- The SDK's "automatic function calling (AFC)" notice is no longer printed on every Gemini call: function calling
+  is switched off explicitly (no call uses tools). No change to any answer.
+
+### Hardening (type-detection endpoints)
+- **Registry safety net:** a per-type reading that comes back empty, or without the document's own number (ID,
+  passport, visa, licence or approval number), is read once more with the general instruction and its empty
+  fields filled from that - only the type's own fields, never replacing a value. A back-only ID side is exempt.
+  If the second reading fails, the first is kept. Costs an extra call only on such a miss.
+- **Several PDFs in one request** no longer fail with "We could not read '<file>'" (PDFium is not thread-safe;
+  PDF rendering now runs one document at a time).
+- **Split step:** a malformed answer part (a non-list `covered_by`, a page entry that is not an object) is
+  skipped instead of failing the file, and an answer is cached only once it was usable - a retry asks again.
+
+### Changed (all endpoints - tell the .NET team)
+- **`passport_issuing_location` (and the signatory's) comes only from a passport**, copied exactly as printed;
+  when the passport prints it only in another language or script (e.g. Arabic), its English name is returned
+  ("الشارقة" -> "Sharjah"). A visa's or ID's own place of issue is never used; an office number is never a place
+  (null). A value that is a country is still given as the exact name from the country list.
+
+### Fixed (type-detection endpoints)
+- **A National ID sent as two files (front and back) is one entry, also when it fails:** `merged: true`, both
+  files in `sources`, and the message shown once - it used to come back as two entries with the same error.
+- A front/back pair that passed its own check but was failed by a later check (cross-check, "doesn't belong to
+  the tenant") showed `valid` with no message; it now keeps that check's message.
+- **Crash (HTTP 500) on a cross-check conflict with an ID sent as two files** when the model named the card
+  "National ID" (its sides are labelled "National ID 1" / "National ID 2"). The card is now found by any of its
+  names and called "National ID" in messages when it is the tenant's only one; a conflict naming only one known
+  document gets "doesn't match the other documents" instead of crashing.
+
 ### Fixed (all endpoints - processed files only, response format unchanged)
 - **Processed file was the whole uncropped page.** The box-detection call sometimes answers its corners on
   a 0-1000 scale instead of the 0-1 fractions it is asked for; every corner then clamped to the page edge,
@@ -12,6 +69,10 @@ major version means a change that existing callers must adapt to.
   "duplicate". Both scales are now read, so each card is cropped, straightened and flattened on its own.
   A fraction just past the edge (e.g. `1.002`, a corner placed slightly outside the image) is still read
   as a fraction.
+- **A National ID's front and back sent as two files** came back uncropped: on that merged file the box call
+  answered x and y on different scales, with corners crossed or one far off, and the page was taken whole. Each
+  page of a merged National ID is now read axis by axis and cropped to the rectangle around the card, then
+  snapped to its edges. Other documents are cropped as before.
 
 ### Fixed (type-detection endpoints)
 - **Small cards on a large scan were taken as the whole page.** An ID card on an A4 scan is under 4% of
@@ -20,11 +81,6 @@ major version means a change that existing callers must adapt to.
   regions now only need 0.5% of the page, and a region that falls back to the whole page paints nothing.
 - Cut-outs on a page shared with other documents keep a small margin (2% of the long edge), with other
   documents inside the margin painted out, so a tight split box no longer cuts a card's edge.
-- Cut-outs now get the 4-corner box call too (only one document, filling at least half the cut-out, is
-  used; otherwise the cut-out is kept whole), so they can be straightened. **Under review:** the model's
-  corners can be slightly off and cut a card's edge - a deskew-only alternative is proposed.
-
-### Fixed (type-detection endpoints)
 - **A document that doesn't belong to the tenant is now rejected on its own.** Every supporting
   document must be shown to belong to a tenant - also when there is only one: an individual's
   document must print their name or ID number, and a trade licence or initial approval must LIST

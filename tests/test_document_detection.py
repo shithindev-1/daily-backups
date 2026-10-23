@@ -798,31 +798,59 @@ def test_split_regions_may_be_far_smaller_than_the_box_calls_minimum() -> None:
                            min_area_ratio=0.005)[0].method == "gemini_vision"
 
 
-@pytest.mark.parametrize(
-    ("documents", "expected"),
-    [
-        # The document fills most of the cut-out: its four corners are used.
-        ([{"label": "passport", "corners": _corners(0.05, 0.05, 0.95, 0.95)}], "gemini_vision"),
-        # Only a small box: a stray answer - the cut-out is taken whole.
-        ([{"label": "stamp", "corners": _corners(0.1, 0.1, 0.4, 0.4)}], "fallback_full_frame"),
-        # Nothing found: taken whole.
-        ([], "fallback_full_frame"),
-    ],
-)
-def test_a_cut_out_uses_only_one_document_that_fills_most_of_it(documents, expected) -> None:
-    from app.services.detection import _single_document
+def test_pdfs_are_rendered_one_at_a_time() -> None:
+    # PDFium is not thread-safe: several PDFs of one request rendered in parallel threads crashed.
+    import threading
 
-    detections = page_detections(page_number=1, width=400, height=300,
-                                 page_result={"found": bool(documents), "documents": documents})
-    assert _single_document(detections, page_number=1, width=400, height=300).method == expected
+    from app.services import detection
+
+    pdf_buffer = io.BytesIO()
+    Image.new("RGB", (200, 120), "white").save(pdf_buffer, format="PDF")
+    content = pdf_buffer.getvalue()
+    inside, most = 0, 0
+    guard = threading.Lock()
+    original = detection._render_pdf_pages_locked
+
+    def counting(*args, **kwargs):
+        nonlocal inside, most
+        with guard:
+            inside += 1
+            most = max(most, inside)
+        try:
+            return original(*args, **kwargs)
+        finally:
+            with guard:
+                inside -= 1
+
+    detection._render_pdf_pages_locked = counting
+    try:
+        threads = [threading.Thread(target=detection.render_pages, args=(content, "application/pdf", 72)) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        detection._render_pdf_pages_locked = original
+    assert most == 1
 
 
-def test_a_cut_out_with_two_boxes_keeps_only_the_largest() -> None:
-    from app.services.detection import _single_document
+def test_corners_in_a_crossed_order_are_still_a_document() -> None:
+    # Answered top-left, bottom-right, top-right, bottom-left: traced as given it is a bow-tie with no area.
+    crossed = [{"x": 0.082, "y": 0.286}, {"x": 0.907, "y": 0.673}, {"x": 0.894, "y": 0.285}, {"x": 0.084, "y": 0.673}]
+    result = {"found": True, "documents": [{"label": "national id back", "corners": crossed}]}
+    detection = page_detections(page_number=1, width=1000, height=1000, page_result=result, order_corners=True)[0]
 
-    detections = page_detections(page_number=1, width=400, height=300, page_result={"found": True, "documents": [
-        {"label": "edge of a neighbour", "corners": _corners(0.0, 0.0, 0.2, 0.3)},
-        {"label": "passport", "corners": _corners(0.1, 0.05, 0.95, 0.95)},
-    ]})
-    kept = _single_document(detections, page_number=1, width=400, height=300)
-    assert kept.label == "passport" and kept.region_number == 1
+    assert detection.method == "gemini_vision"
+    assert detection.box == [[82, 285], [907, 285], [907, 673], [82, 673]]
+    # Only a National ID's merged front/back gets this: every other crop is read as before.
+    assert page_detections(page_number=1, width=1000, height=1000, page_result=result)[0].method == "fallback_invalid_response"
+
+
+def test_a_merged_id_page_with_x_and_y_on_different_scales_is_still_cropped() -> None:
+    # Seen live: x as fractions, y on 0-1000, and one corner far off (0.74) - in a single answer.
+    mixed = [{"x": 0.076, "y": 240.0}, {"x": 0.916, "y": 243.0}, {"x": 0.917, "y": 641.0}, {"x": 0.74, "y": 633.0}]
+    result = {"found": True, "documents": [{"label": "national id front", "corners": mixed}]}
+    detection = page_detections(page_number=1, width=3334, height=4445, page_result=result, order_corners=True)[0]
+
+    assert detection.method == "gemini_vision"
+    assert detection.axis_aligned_bbox == [253, 1067, 3057, 2849]

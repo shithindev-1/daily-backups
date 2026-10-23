@@ -4,20 +4,26 @@ from typing import Any
 
 import pytest
 
-from app.schemas.ocr import COMPANY_EXTRACTION_FIELDS, INDIVIDUAL_EXTRACTION_FIELDS, VERIFIABLE_TYPES
+from app.schemas.ocr import (
+    COMPANY_EXTRACTION_FIELDS,
+    DETECT_DOCUMENT_TYPES,
+    INDIVIDUAL_EXTRACTION_FIELDS,
+    PROPERTY_FIELDS,
+)
 from app.services import document_registry as registry
 from app.services.gemini import prompts
 
 
 def test_every_supported_type_has_an_entry() -> None:
-    assert set(registry.REGISTRY) == set(VERIFIABLE_TYPES)
+    assert set(registry.REGISTRY) == set(DETECT_DOCUMENT_TYPES)
 
 
-@pytest.mark.parametrize("document_type", sorted(VERIFIABLE_TYPES))
+@pytest.mark.parametrize("document_type", sorted(DETECT_DOCUMENT_TYPES))
 @pytest.mark.parametrize("company", [False, True])
 def test_every_field_is_known_and_defined(document_type: str, company: bool) -> None:
     fields = registry.extraction_fields(document_type, company)
-    known = COMPANY_EXTRACTION_FIELDS if company else INDIVIDUAL_EXTRACTION_FIELDS
+    # Property details are read on the type-detection endpoints only, to match a rental index.
+    known = (COMPANY_EXTRACTION_FIELDS if company else INDIVIDUAL_EXTRACTION_FIELDS) + PROPERTY_FIELDS
     assert fields and set(fields) <= set(known)
     rules = registry.field_rules(document_type, company)
     definitions = registry.COMPANY_FIELD_RULES if company else registry.INDIVIDUAL_FIELD_RULES
@@ -67,7 +73,9 @@ def test_detect_endpoints_read_focused_and_old_endpoints_do_not(monkeypatch: pyt
 
     async def fake_extract(**kwargs: Any) -> dict[str, Any]:
         calls.append(kwargs)
-        return {"data": dict.fromkeys(DATA_FIELDS), "documentComplete": True, "documentTypesPresent": ["national_id"],
+        # The ID number is read, so the focused reading needs no second, general reading.
+        return {"data": {**dict.fromkeys(DATA_FIELDS), "National_Id": "784-1990-1234567-1"}, "documentComplete": True,
+                "documentTypesPresent": ["national_id"],
                 "frontVisible": True, "backVisible": True}
 
     async def fake_segment(pages: list[bytes]) -> list[dict[str, Any]]:
@@ -110,3 +118,130 @@ def test_decoding_settings_are_sent_on_every_call() -> None:
 
     config = get_gemini_service()._generation_config()
     assert (config.temperature, config.seed, config.top_p, config.top_k) == (0.0, 0, 1.0, 1)
+
+
+
+# --- safety net: a focused reading that misses the document's own number is read again --------------
+
+def _reading(**values: Any) -> dict[str, Any]:
+    from app.schemas.ocr import DATA_FIELDS
+
+    return {"data": {**dict.fromkeys(DATA_FIELDS), **values}, "documentComplete": True,
+            "documentTypesPresent": ["passport"], "frontVisible": True, "backVisible": True}
+
+
+def _read(monkeypatch: pytest.MonkeyPatch, answers: dict[bool, Any], document_type: str = "passport") -> tuple[dict, list]:
+    import asyncio
+
+    from app.services import result_cache
+    from app.services.gemini import get_gemini_service
+    from app.services.ocr_pipeline import extract_and_type_check
+
+    calls: list[bool] = []
+
+    async def fake_extract(**kwargs: Any) -> dict[str, Any]:
+        focused = kwargs.get("focused", False)
+        calls.append(focused)
+        answer = answers[focused]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(get_gemini_service(), "extract", fake_extract)
+    monkeypatch.setattr(result_cache, "get", lambda key: None)
+    monkeypatch.setattr(result_cache, "put", lambda key, value: None)
+    document = asyncio.run(extract_and_type_check(
+        request_id="r", position="1/1", content=b"x", filename="p.png", mime_type="image/png", sha256="s",
+        document_name="Passport", document_type=document_type, started_at=0.0, check_type=False, focused=True,
+    ))
+    return document["data"], calls
+
+
+def test_a_focused_reading_missing_its_own_number_is_completed_by_a_general_reading(monkeypatch: pytest.MonkeyPatch) -> None:
+    focused = _reading(Tenant_Name_En="Magdy Ali")
+    general = _reading(Tenant_Name_En="MAGDY ALI", Passport_Number="A28334482", Passport_Issuing_Location="3",
+                       Visa_Number="201/2023/1")
+    data, calls = _read(monkeypatch, {True: focused, False: general})
+
+    assert calls == [True, False]
+    assert data["Passport_Number"] == "A28334482"      # filled from the general reading
+    assert data["Tenant_Name_En"] == "Magdy Ali"       # a focused value is never replaced
+    assert data["Passport_Issuing_Location"] is None   # an office number is still never a place
+    assert data.get("Visa_Number") is None             # only the passport's own fields are filled
+
+
+def test_a_focused_reading_with_its_own_number_is_not_read_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    data, calls = _read(monkeypatch, {True: _reading(Passport_Number="A28334482"), False: _reading()})
+
+    assert calls == [True] and data["Passport_Number"] == "A28334482"
+
+
+def test_a_failed_general_reading_keeps_the_focused_reading(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services.gemini.client import GeminiServiceError
+
+    data, calls = _read(monkeypatch, {True: _reading(Tenant_Name_En="Magdy Ali"), False: GeminiServiceError("down")})
+
+    assert calls == [True, False] and data["Tenant_Name_En"] == "Magdy Ali" and data["Passport_Number"] is None
+
+
+def test_the_back_of_an_id_shown_alone_need_not_print_its_number(monkeypatch: pytest.MonkeyPatch) -> None:
+    back = {**_reading(Occupation="Engineer"), "frontVisible": False, "documentTypesPresent": ["national_id"]}
+    data, calls = _read(monkeypatch, {True: back, False: _reading()}, document_type="national_id")
+
+    assert calls == [True] and data["Occupation"] == "Engineer"
+
+
+
+def test_detect_readings_may_report_a_rental_index_and_old_ones_are_unchanged() -> None:
+    # The shared type list says "exactly these spellings and no others": without rental_index in it, a
+    # rental index was reported as "other" and rejected by the type check.
+    for document_type in ("rental_index", "passport", "ejari_certificate"):
+        instruction, _ = prompts.focused_system_instruction(document_type, company=False)
+        assert "rental_index for a rental index result" in instruction
+    assert "rental_index" not in prompts.SYSTEM_INSTRUCTION
+    assert "rental_index" not in prompts.COMPANY_SYSTEM_INSTRUCTION
+
+
+
+def test_a_rental_index_is_never_reported_as_expired_by_its_contract_end_date() -> None:
+    assert "never report the rental index, or that date, as expired" in prompts.covered_parts_rules("rental_index")
+    assert "RENTAL INDEX" not in prompts.covered_parts_rules("passport")
+
+
+
+def test_page_numbering_is_never_a_problem_on_the_detect_self_check() -> None:
+    # A 7-page bank statement printing "Page 1 of 1" on its pages was rejected for its page count.
+    assert "never report anything about page numbers, page counts" in prompts.SHORT_SELF_MESSAGES
+    assert "PAGES - never report" not in prompts.SELF_VERIFICATION_PROMPT
+
+
+
+# --- document-usage.log: tokens per document, adding up to the request's total -----------------------
+
+def test_tokens_are_charged_per_document_and_add_up_to_the_request() -> None:
+    from app.services.gemini import usage
+
+    usage.start_usage_tracking()
+    with usage.usage_for(("file scan.pdf #1", "")):
+        usage.record_usage(usage.CALL_SEGMENTATION, 900, 90)          # one split call for the file
+    usage.share_usage("file scan.pdf #1", [("Passport", "passport"), ("Visa", "visa"), ("Bill (not listed)", "other")])
+    with usage.usage_for(*usage.documents_named("Passport", "passport")):
+        usage.record_usage(usage.CALL_EXTRACTION, 3000, 200)
+    with usage.usage_for(*usage.documents_named("National ID 1 + National ID 2", "national_id")):
+        usage.record_usage(usage.CALL_VALIDATION, 2000, 100)           # a merged front/back pair
+    with usage.usage_for(("Passport", "passport"), ("Visa", "visa")):
+        usage.record_usage(usage.CALL_VALIDATION, 1000, 50)            # a cross-check of two documents
+    usage.record_usage(usage.CALL_ROTATION, 10, 1)                     # made for no document
+
+    rows = {row["document"]: row for row in usage.document_usage()}
+
+    assert rows["Passport"]["document_type"] == "passport"
+    assert rows["Passport"]["extraction"] == {"calls": 1, "input_tokens": 3000, "output_tokens": 200}
+    assert rows["Passport"]["segmentation"] == {"calls": 1, "input_tokens": 300, "output_tokens": 30}
+    assert rows["Passport"]["validation"]["input_tokens"] == 500
+    assert rows["National ID 1"]["validation"]["input_tokens"] == 1000 == rows["National ID 2"]["validation"]["input_tokens"]
+    assert rows["Bill (not listed)"]["document_type"] == "other"
+    assert rows["unassigned"]["rotation"]["calls"] == 1
+    total = usage.usage_summary()["request_total"]
+    assert sum(row["document_total"]["input_tokens"] for row in rows.values()) == total["input_tokens"]
+    assert sum(row["document_total"]["output_tokens"] for row in rows.values()) == total["output_tokens"]

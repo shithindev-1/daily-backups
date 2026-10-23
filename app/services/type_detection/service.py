@@ -16,7 +16,7 @@ from app.core.config import settings
 from app.schemas.leasing import SourceDocument
 from app.services import blob_storage
 from app.services.concurrency import run_concurrently
-from app.services.gemini import get_gemini_service, start_usage_tracking
+from app.services.gemini import get_gemini_service, share_usage, start_usage_tracking, usage_for
 from app.services.leasing import sources as source_fetch
 from app.services.leasing.batch import process_batch
 from app.services.leasing.rules import require_mandatory_document
@@ -24,12 +24,17 @@ from app.services.leasing.sources import safe_name
 from app.services.ocr_pipeline import VerificationUnavailable, call_with_one_retry, log_request_usage
 from app.services.post_processing import document_label
 from app.services.type_detection.responses import build_detect_response, document_entry
-from app.services.type_detection.segmentation import OTHER_TYPE, Segment, segment_file
+from app.services.type_detection.segmentation import OTHER_TYPE, Segment, parse_side, segment_file
 from app.services.validation import ALLOWED_FILES, validate_document_request
 
 
 def _file_name(item: dict[str, Any]) -> str:
     return item.get("filename") or posixpath.basename(urlparse(item["source"]).path) or item["source"]
+
+
+def _file_usage_name(item: dict[str, Any]) -> str:
+    """The name a file's split call is charged under until its documents are known."""
+    return f"file {_file_name(item)} #{id(item)}"
 
 
 async def _segment_one(item: dict[str, Any], request_id: str) -> None:
@@ -48,13 +53,15 @@ async def _segment_one(item: dict[str, Any], request_id: str) -> None:
         return
     item["mime_type"] = validated.mime_type
     try:
-        item["segments"] = await call_with_one_retry(
-            lambda: segment_file(
-                content=item["content"], mime_type=validated.mime_type, sha256=validated.sha256,
-                settings=settings, gemini_service=get_gemini_service(),
-            ),
-            what="Segmentation", request_id=request_id,
-        )
+        # Charged to the file until its documents are known - then shared among them (process_detected).
+        with usage_for((_file_usage_name(item), "")):
+            item["segments"] = await call_with_one_retry(
+                lambda: segment_file(
+                    content=item["content"], mime_type=validated.mime_type, sha256=validated.sha256,
+                    settings=settings, gemini_service=get_gemini_service(),
+                ),
+                what="Segmentation", request_id=request_id,
+            )
     except VerificationUnavailable:
         item["error"] = (
             f"We could not read '{_file_name(item)}' right now. Please try again in a few minutes."
@@ -79,6 +86,33 @@ def _labels(found: list[tuple[dict[str, Any], Segment]]) -> list[str]:
     return labels
 
 
+def _unsupported_error(segment: Segment, file_name: str, shared: bool) -> str:
+    """The error for a document outside the supported types: what it is, where, and that it is not
+    listed - "The DEWA utility bill found on page 2 of 'docs.pdf' is not listed."."""
+    name = segment.detected_type
+    # "Driving licence" -> "driving licence"; an acronym ("UAE driving licence", "DEWA bill") is kept.
+    if name and not (len(name) > 1 and name[1].isupper()):
+        name = name[:1].lower() + name[1:]
+    where = f"found on {_pages_text(segment.pages)} of '{file_name}'" if shared else f"in '{file_name}'"
+    return f"The {name or 'document'} {where} is not listed."
+
+
+# A side of a document (or a one-sided document) more than this share covered by another document is
+# rejected outright - measured in code from the split boxes, so the same photo always gets the same answer.
+_MAX_COVERED_SHARE = 0.5
+
+
+def _covered_error(segment: Segment) -> str | None:
+    """The message for a document with a side mostly hidden under another document, or None."""
+    for region, share in zip(segment.regions, segment.covered):
+        if share > _MAX_COVERED_SHARE:
+            kind = document_label(segment.document_type)
+            side = parse_side(region.label)
+            whose = f"The {side} of your {kind}" if side in ("front", "back") else f"Your {kind}"
+            return f"{whose} is mostly covered by another document. Please upload a photo with nothing on top of it."
+    return None
+
+
 def _batch_item(item: dict[str, Any], segment: Segment, label: str, number: int) -> dict[str, Any]:
     """What `process_batch` takes for one found document: the original file when it holds only this
     document, otherwise the document's own cut-out file."""
@@ -93,9 +127,10 @@ def _batch_item(item: dict[str, Any], segment: Segment, label: str, number: int)
             batch_item["blob_path"] = item["blob_path"]
         return batch_item
 
-    # Already cut out, with other documents blanked out: the final crop looks for just this one
-    # document on it (to straighten it) and otherwise takes it whole.
+    # Already cut to its own edges, with other documents blanked out: the final crop takes it whole.
     batch_item["precut"] = True
+    if error := _covered_error(segment):
+        batch_item["covered_error"] = error
     stem = Path(item["filename"]).stem or "document"
     filename = f"{safe_name(stem)}_{document_id}{segment.extension}"
     batch_item.update(content=segment.content, filename=filename, content_type=ALLOWED_FILES[segment.extension])
@@ -174,13 +209,26 @@ async def process_detected(
 
     found = [(item, segment) for item in items for segment in item["segments"]]
     supported = [(item, segment) for item, segment in found if segment.document_type != OTHER_TYPE]
-    ignored = [
+    # Files that hold more than one document: their documents' messages say where each was found.
+    shared_files = {id(item) for item in items if len(item["segments"]) > 1}
+    # A document outside the supported types is never read: it is rejected, by its name, on its own -
+    # it fails the request, not the tenant whose documents are still checked and extracted.
+    unsupported = [
         document_entry(
-            document_type=OTHER_TYPE, status="ignored",
-            sources=[_source_row(item, segment.pages)], error=None,
+            document_type=OTHER_TYPE, status="invalid", sources=[_source_row(item, segment.pages)],
+            error=_unsupported_error(segment, _file_name(item), id(item) in shared_files),
         )
         for item, segment in found if segment.document_type == OTHER_TYPE
     ]
+
+    # A file's split call is shared among the documents found in it (document-usage.log).
+    found_labels = dict(zip(map(id, (segment for _, segment in supported)), _labels(supported)))
+    for item in items:
+        share_usage(_file_usage_name(item), [
+            (found_labels[id(segment)], segment.document_type) if id(segment) in found_labels
+            else (f"{segment.detected_type or 'Other document'} (not listed)", segment.document_type)
+            for segment in item.get("segments") or []
+        ])
 
     # Same rule and message as the normal endpoints, judged on the types that were found. Each
     # tenant's own mandatory document is checked once the documents are grouped into tenants.
@@ -205,8 +253,6 @@ async def process_detected(
     )
 
     by_name = result.get("tenant_ids_by_name") or {}
-    # Files that hold more than one supported document: their documents' messages say where each was found.
-    shared_files = {id(item) for item in items if sum(s.document_type != OTHER_TYPE for s in item["segments"]) > 1}
     documents = []
     for report in result["documents"]:
         names = [source["document_name"] for source in report["sources"]]
@@ -226,7 +272,8 @@ async def process_detected(
             ],
             error=locate_error(report["error"], report["document_type"], places),
         ))
-    return finish(result["status"], documents + ignored, tenants=result.get("tenants") or [])
+    status = "failed" if unsupported else result["status"]
+    return finish(status, documents + unsupported, tenants=result.get("tenants") or [])
 
 
 async def process_detected_sources(

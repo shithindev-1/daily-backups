@@ -23,7 +23,7 @@ import numpy as np
 from PIL import Image
 
 from app.core.config import Settings
-from app.schemas.ocr import VERIFIABLE_TYPES
+from app.schemas.ocr import DETECT_DOCUMENT_TYPES, OTHER_DOCUMENT_TYPE
 from app.services import result_cache
 from app.services.detection import (
     PDF_PAGE_QUALITY,
@@ -38,7 +38,7 @@ from app.services.detection import (
 
 logger = logging.getLogger("uae_ocr")
 
-OTHER_TYPE = "other"
+OTHER_TYPE = OTHER_DOCUMENT_TYPE
 # Pages are rendered sharper than for the crop/rotate output (detection_pdf_dpi): a cut-out ID card
 # is read again from these pixels, and its long numbers need the resolution.
 _SEGMENT_PDF_DPI = 300
@@ -64,7 +64,7 @@ class DocumentSegmenter(Protocol):
 class Segment:
     """One document found in a file."""
 
-    document_type: str  # one of VERIFIABLE_TYPES, or "other"
+    document_type: str  # one of DETECT_DOCUMENT_TYPES, or "other"
     pages: list[int]  # 1-based pages of the original file it was found on
     # The document's own file, cut out of the original - or None when the original file holds this
     # one document only and is used as it is.
@@ -73,13 +73,15 @@ class Segment:
     regions: list[PageDetection] = field(default_factory=list, repr=False)
     # Share of each region (in order) blanked because another document lay on top of it.
     covered: list[float] = field(default_factory=list)
+    # For an "other" document: its exact name as the split call read it ("UAE driving licence"), else "".
+    detected_type: str = ""
 
 
 def _region_label(region: dict[str, Any], page_number: int, position: int) -> str:
     """Carries a region's type, document, side and the documents lying on top of it through
     `page_detections`, which keeps only a label per region: "<type>:<document key>:<side>:<covered by>"."""
     document_type = str(region.get("document_type") or OTHER_TYPE)
-    if document_type not in VERIFIABLE_TYPES:
+    if document_type not in DETECT_DOCUMENT_TYPES:
         document_type = OTHER_TYPE
     try:
         number = int(region.get("document_number"))
@@ -89,12 +91,25 @@ def _region_label(region: dict[str, Any], page_number: int, position: int) -> st
     side = str(region.get("side") or "single")
     # Its own number is kept: it means the other side of the same card lies on top of this region.
     covered_by = []
-    for value in region.get("covered_by") or []:
+    listed = region.get("covered_by")
+    for value in listed if isinstance(listed, list) else []:
         try:
             covered_by.append(str(int(value)))
         except (TypeError, ValueError):
             continue
     return f"{document_type}:{number}:{side if side in _SIDE_ORDER else 'single'}:{','.join(covered_by)}"
+
+
+def _document_name(region: dict[str, Any]) -> str:
+    """An unsupported document's own name from the split answer - plain text, kept short."""
+    name = " ".join(str(region.get("document_name") or "").split())
+    return name[:80]
+
+
+def parse_side(label: str) -> str:
+    """A region's side ("front", "back" or "single") from its detection label - "" for any other label."""
+    parsed = _parse_label(label)
+    return parsed[2] if parsed else ""
 
 
 def _parse_label(label: str) -> tuple[str, int, str, set[int]] | None:
@@ -168,6 +183,7 @@ class _Region:
     number: int
     side: str
     covered_by: set[int]
+    name: str = ""
 
 
 def _quad(detection: PageDetection) -> np.ndarray:
@@ -256,7 +272,9 @@ def build_segments(
     regions_by_page: list[list[_Region]] = []
     for index, (image, page_result) in enumerate(zip(images, page_results)):
         page_number = index + 1
-        raw = [region for region in (page_result or {}).get("regions") or [] if isinstance(region, dict)]
+        # Anything but a list of region objects is read as "nothing found on this page".
+        regions = page_result.get("regions") if isinstance(page_result, dict) else None
+        raw = [region for region in regions if isinstance(region, dict)] if isinstance(regions, list) else []
         detections = page_detections(
             page_number=page_number, width=image.shape[1], height=image.shape[0],
             page_result={
@@ -276,8 +294,10 @@ def build_segments(
                 continue  # a blank page
             siblings = [other.box for other in detections if other is not detection]
             document_type, number, side, covered_by = parsed
+            # page_detections keeps the answer's order: region_number N is the answer's Nth region.
+            name = _document_name(raw[detection.region_number - 1]) if document_type == OTHER_TYPE else ""
             page_regions.append(_Region(
-                refine_detection(image, detection, siblings), image, document_type, number, side, covered_by,
+                refine_detection(image, detection, siblings), image, document_type, number, side, covered_by, name,
             ))
         regions_by_page.append(_drop_repeats(page_regions))
 
@@ -295,6 +315,7 @@ def build_segments(
             document_type=document_type,
             pages=sorted({region.detection.page_number for region in members}),
             regions=[region.detection for region in members],
+            detected_type=next((region.name for region in members if region.name), "") if document_type == OTHER_TYPE else "",
         ))
 
     if len(segments) > 1:
@@ -323,12 +344,13 @@ async def segment_file(
     images = await asyncio.to_thread(render_pages, content, mime_type, max(settings.detection_pdf_dpi, _SEGMENT_PDF_DPI))
     cache_key = ("segmentation", settings.gemini_model, sha256)
     page_results = result_cache.get(cache_key)
+    fresh = False
     if page_results is None:
         encoded = await asyncio.to_thread(
             lambda: [encode_png(downscale_for_detection(image, settings.gemini_max_image_edge)) for image in images]
         )
         page_results = await gemini_service.segment_documents(encoded)
-        result_cache.put(cache_key, page_results)
+        fresh = True
         logger.info(
             "Segmentation answer sha256=%s regions=%s", sha256,
             [
@@ -339,6 +361,10 @@ async def segment_file(
             ],
         )
     segments = await asyncio.to_thread(build_segments, images, page_results, settings)
+    if fresh:
+        # Cached only once it was usable, so a retry after a failure asks the model again instead of
+        # reusing the answer that failed.
+        result_cache.put(cache_key, page_results)
     logger.info(
         "Segmentation sha256=%s pages=%d documents=%s covered=%s",
         sha256, len(images), [(segment.document_type, segment.pages) for segment in segments],
