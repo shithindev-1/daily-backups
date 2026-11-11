@@ -33,11 +33,15 @@ def build_detect_response(
 
 def document_entry(
     *, document_type: str, status: str, sources: list[dict[str, Any]], error: str | None,
-    merged: bool = False, tenant_ids: list[str] | None = None,
+    merged: bool = False, tenant_ids: list[str] | None = None, ignored_reason: str | None = None,
+    note: str | None = None,
 ) -> dict[str, Any]:
+    """One `documents` entry. `error` is ONLY ever something the user must fix; an ignored document
+    (a copy set aside) has no error - `ignored_reason` says why as a fixed code and `note` in words."""
     return {
         "tenant_ids": tenant_ids or [], "document_type": document_type, "status": status,
         "merged": merged, "sources": sources, "error": error,
+        "ignored_reason": ignored_reason, "note": note,
     }
 
 

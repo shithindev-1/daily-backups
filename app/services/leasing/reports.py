@@ -85,6 +85,9 @@ def build_response(
     }
 
 
+_CARRIED_KEYS = ("ignored", "ignored_reason", "note", "_stage", "_detail", "_kept_names", "_original_failed")
+
+
 def fold_merged_pairs(
     documents_report: list[dict[str, Any]], merged_pairs: list[tuple[int, int, str]],
 ) -> list[dict[str, Any]]:
@@ -105,6 +108,12 @@ def fold_merged_pairs(
         for index in (front_index, back_index):
             if documents_report[index]["error"]:
                 add_error(entry, documents_report[index]["error"])
+        # Why the card ended as it did (type-detection: set aside as ignored; the failing step for the logs).
+        for key in _CARRIED_KEYS:
+            value = next((documents_report[index][key] for index in (front_index, back_index)
+                          if documents_report[index].get(key) is not None), None)
+            if value is not None:
+                entry[key] = value
         folded[first] = entry
         absorbed.add(second)
     return [

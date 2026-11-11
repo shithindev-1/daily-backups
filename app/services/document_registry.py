@@ -358,6 +358,10 @@ _OWN_NUMBERS = {
 }
 
 
+# The same, whatever fields the document was read with (absent fields simply read as empty).
+OWN_NUMBER_FIELDS = _OWN_NUMBERS
+
+
 def own_numbers(document_type: str, company: bool) -> tuple[str, ...]:
     """The fields holding the document's own number, among the fields it is read with (none for a
     type without one, such as a cheque, or a licence read for an individual)."""

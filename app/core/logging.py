@@ -146,6 +146,16 @@ def configure_logging(settings: Settings) -> None:
         logging.Formatter("%(message)s"),
         propagate=False,
     )
+    # One JSON object per request: every document's outcome - its status, which step failed it and why,
+    # the message the caller got, and why a copy was set aside (ignored) - so any failed request can be
+    # explained from the logs alone.
+    _configure_file_logger(
+        "uae_ocr.document_results",
+        log_directory / "document-results.log",
+        settings,
+        logging.Formatter("%(message)s"),
+        propagate=False,
+    )
     # One JSON object per line: the rotation Gemini asked for and what OpenCV actually applied,
     # per cropped document, so bad rotations can be audited without re-running anything.
     _configure_file_logger(

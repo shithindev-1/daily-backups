@@ -34,6 +34,7 @@ from app.services.gemini import (
     record_stage,
     start_usage_tracking,
 )
+from app.services.leasing.outcomes import log_document_results, outcome, tag_errors, without_private_keys
 from app.services.leasing.outputs import (
     document_folder,
     merged_folder,
@@ -57,7 +58,7 @@ from app.services.leasing.rules import (
 )
 from app.services.leasing.signatory import apply_signatory_role_from_license
 from app.services.leasing.sources import download_blob, download_source, safe_name
-from app.services.leasing.tenant_results import finish_per_tenant
+from app.services.leasing.tenant_results import finish_per_tenant, set_aside_repeated_files
 from app.services.ocr_pipeline import (
     CROSS_VERIFICATION_UNAVAILABLE,
     VerificationUnavailable,
@@ -121,10 +122,30 @@ async def process_batch(
 
     def _finish(status: str, *, form_data: dict[str, Any] | None = None,
                 documents: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        documents = documents if documents is not None else documents_report
+        if not detected_types:
+            # The old endpoints: the only errors not yet tied to a step are the cross-check's. Their
+            # line goes to document-results.log; the private keys never reach the response.
+            tag_errors(documents_report, "cross_verification")
+            log_document_results(
+                request_id=request_id, endpoint="leasing", tenant_type=tenant_type, status=status,
+                documents=[
+                    outcome(
+                        number=number, names=[source["document_name"] for source in document["sources"]],
+                        document_type=document["document_type"],
+                        status="invalid" if document["error"] else "valid",
+                        files=[{"file": posixpath.basename(urlparse(str(source["source"])).path) or source["document_name"],
+                                "pages": source["pages"]} for source in document["sources"]],
+                        report=document, error=document["error"],
+                    )
+                    for number, document in enumerate(documents, start=1)
+                ],
+            )
+            documents = without_private_keys(documents)
+        # The type-detection endpoint logs its own line once its response is built (type_detection.service).
         return build_response(
             status=status, tenant_type=tenant_type, document_refnumber=document_refnumber,
-            started_at=started_at, documents=documents if documents is not None else documents_report,
-            form_data=form_data,
+            started_at=started_at, documents=documents, form_data=form_data,
         )
 
     def _failed() -> dict[str, Any]:
@@ -152,6 +173,7 @@ async def process_batch(
         )
         record_stage(stage, now - stage_started)
         stage_started = now
+        tag_errors(documents_report, stage)
 
     progress.report("download")
 
@@ -161,6 +183,7 @@ async def process_batch(
         report = documents_report[index]
         if item.get("error"):
             report["error"] = item["error"]
+            report["_stage"] = item.get("_stage") or "download"
             return None, False
 
         position = f"{index + 1}/{len(items)}"
@@ -180,6 +203,7 @@ async def process_batch(
             )
         except HTTPException as exc:
             report["error"] = str(exc.detail)
+            report["_stage"] = "file_check"
             return None, False
 
         report["document_type"] = validated.document_type
@@ -209,6 +233,7 @@ async def process_batch(
         except ValidationStopped as stopped:
             # The only stop `_extract_and_type_check` raises is a document type mismatch.
             report["error"] = first_error_message(stopped.response)
+            report["_stage"] = "type_check"
             return None, False
 
         if detected_types and not any(
@@ -217,6 +242,8 @@ async def process_batch(
             report["error"] = unconfirmed_type_error(
                 item["document_name"], validated.document_type, candidate["types_present"],
             )
+            report["_stage"] = "type_check"
+            report["_detail"] = {"detected": validated.document_type, "second_reading": candidate["types_present"]}
             return None, False
 
         report["document_type_is_correct"] = True
@@ -235,6 +262,10 @@ async def process_batch(
         return _failed()
     # Upload order is kept: merge_extracted_data takes the first non-null value in this order.
     candidates = [candidate for candidate, _ in outcomes if candidate is not None]
+    if detected_types:
+        # The same file sent twice would confuse the front/back pairing (two identical fronts): every
+        # repeat is set aside as a duplicate before anything is paired.
+        candidates = set_aside_repeated_files(candidates, index_by_name, documents_report)
 
     # 2. Front/back pairing, per document type.
     resolved = await resolve_pairs_per_type(
@@ -250,6 +281,7 @@ async def process_batch(
             # Mostly hidden under another document (type-detection cut-out): rejected without a self-check.
             for upload_index in merged_indices(document, index_by_name):
                 documents_report[upload_index]["error"] = document["_covered_error"]
+                documents_report[upload_index]["_stage"] = "covered_by_other_document"
             del document["content"]
             return False
         try:

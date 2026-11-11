@@ -40,12 +40,22 @@ class DetectedDocument(BaseModel):
     status: Literal["valid", "invalid", "ignored", "not_checked"] = Field(
         ...,
         description='valid: passed its own checks. invalid: see error - an "other" (unsupported) document is '
-                    "invalid, its error naming what it is. not_checked: another file could not be read, so "
-                    "nothing was checked.",
+                    "invalid, its error naming what it is. ignored: a copy that is not needed (see ignored_reason "
+                    "and note) - not an error. not_checked: another file could not be read, so nothing was checked.",
     )
     merged: bool
     sources: list[DetectedSource]
-    error: str | None
+    error: str | None = Field(
+        ..., description="Only ever a problem the user must fix; null for valid and ignored documents.",
+    )
+    ignored_reason: Literal["expired_copy", "replaced_copy", "duplicate", "older_copy"] | None = Field(
+        None,
+        description="Why an ignored document was set aside (null otherwise): expired_copy - an expired copy next "
+                    "to a valid one of the same holder; replaced_copy - another copy of the holder's document is "
+                    "used; duplicate - the same document uploaded again; older_copy - every copy failed, and the "
+                    "error is shown on the newest one only.",
+    )
+    note: str | None = Field(None, description="Plain-English information about an ignored document. Never an error.")
 
 
 class TenantMissing(BaseModel):

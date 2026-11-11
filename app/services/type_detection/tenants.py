@@ -32,7 +32,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Hashable
 
-from app.services.document_registry import link_numbers
+from app.services.document_registry import OWN_NUMBER_FIELDS, link_numbers
 from app.services.form_normalization import format_date
 from app.services.names import name_tokens, same_name
 
@@ -144,6 +144,51 @@ def _group_people(units: list[Unit], company: bool) -> list[_Person]:
                 people.remove(other)
         person.add(unit.key, ids, name, birth)
     return people
+
+
+def _numbers(unit: Unit, fields: tuple[str, ...]) -> set[str]:
+    return {number for number in (_id(unit.data.get(name)) for name in fields) if number}
+
+
+def _full_name_tokens(unit: Unit) -> set[str]:
+    data = unit.data
+    return name_tokens(data.get("Tenant_Name_En") or data.get("Signatory_Name_En") or data.get("Holder_Name"))
+
+
+def copy_proof(first: Unit, second: Unit, company: bool) -> str | None:
+    """How two documents of one kind (two National IDs, two passports, two licences ...) are PROVEN to be
+    copies of one holder's document - stricter than the tenant grouping, which may join on a date of birth
+    and one shared name word. None when nothing proves it.
+
+      same_document_number  both print the same own number (the same card or licence)
+      same_id_number        identity documents sharing any ID, passport or visa number (a renewed
+                            Emirates ID keeps its number; a visa prints the passport number)
+      same_name_and_birth   the same date of birth and the same name (every part of the shorter name)
+      same_full_name        exactly the same name parts (no date of birth on one side)
+      same_licence_number   licences / approvals sharing a licence or approval number
+      same_company_name     licences / approvals naming the same company
+    """
+    own = OWN_NUMBER_FIELDS.get(first.document_type, ()) + OWN_NUMBER_FIELDS.get(second.document_type, ())
+    if _numbers(first, own) & _numbers(second, own):
+        return "same_document_number"
+    if first.document_type in LICENCE_TYPES:
+        if _numbers(first, _COMPANY_NUMBERS) & _numbers(second, _COMPANY_NUMBERS):
+            return "same_licence_number"
+        name, other = first.data.get("Company_Name_En"), second.data.get("Company_Name_En")
+        return "same_company_name" if name and other and same_name(name, other) else None
+    first_ids, first_name, first_birth = _person_details(first, company)
+    second_ids, second_name, second_birth = _person_details(second, company)
+    if first_ids & second_ids:
+        return "same_id_number"
+    if first_birth and first_birth == second_birth and first_name and second_name and same_name(first_name, second_name):
+        return "same_name_and_birth"
+    tokens, other_tokens = _full_name_tokens(first), _full_name_tokens(second)
+    if len(tokens) >= 2 and tokens == other_tokens and not (first_birth and second_birth and first_birth != second_birth):
+        return "same_full_name"
+    return None
+
+
+_COMPANY_NUMBERS = ("Trade_License_Number", "Initial_Approval_Number")
 
 
 def _identity(unit: Unit, company: bool) -> tuple[set[str], str | None]:

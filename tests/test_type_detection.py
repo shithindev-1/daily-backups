@@ -115,6 +115,8 @@ def test_single_document_file_is_read_as_is_and_typed(client: TestClient, monkey
         "merged": False,
         "sources": [{"source": "eid.png", "file_name": "eid.png", "pages": [1], "ocr_file": None}],
         "error": None,
+        "ignored_reason": None,
+        "note": None,
     }
 
 
@@ -1287,6 +1289,8 @@ def test_user_9_errors_point_into_the_trade_licence_file(client: TestClient, mon
     body = _upload(client, ["eid.png", "bundle.png"]).json()
 
     errors = sorted(d["error"] for d in body["documents"] if d["error"])
+    # The bundle's old National ID shares the valid one's number, but no expiry date was read off it: it can't
+    # be shown to be the OLDER copy, so it keeps its own error (it might be the newer card).
     assert errors == [
         "The National ID found on page 1 of 'bundle.png' expired on 28-04-2024. Please upload a valid National ID.",
         "The visa found on page 1 of 'bundle.png' expired on 28-04-2024. Please upload a valid visa.",
@@ -1426,6 +1430,78 @@ def _one_card_two_files(monkeypatch: pytest.MonkeyPatch, extra: dict[str, list[d
         return True
 
     monkeypatch.setattr(get_gemini_service(), "verify_document_pair", same_card)
+
+
+def test_the_same_files_sent_twice_are_duplicates_and_never_confuse_the_pairing(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The owner's test: the new ID's front and back twice, and the old expired ID twice.
+    monkeypatch.setattr(settings, "validation_enabled", True)
+    _one_card_two_files(
+        monkeypatch, extra={"old_id.png": [_region("national_id", 1)]},
+        answers={"old_id.png": _raw(["national_id"], National_Id="784-1980-1111111-1",
+                                    National_Id_Expiry="11/06/2025", **AHMED)},
+    )
+    old_width = _WIDTHS["old_id.png"]
+
+    async def fake_verify(**kwargs: Any) -> list[str]:
+        if kwargs["content"][:4] == b"%PDF":  # the merged front + back of the new card
+            return []
+        with Image.open(io.BytesIO(kwargs["content"])) as image:
+            expired = image.width == old_width
+        return ["Your National ID expired on 11-06-2025. Please upload a valid National ID."] if expired else []
+
+    async def no_conflicts(**kwargs: Any) -> list[Any]:
+        return []
+
+    monkeypatch.setattr(get_gemini_service(), "verify_document", fake_verify)
+    monkeypatch.setattr(get_gemini_service(), "verify_documents_cross", no_conflicts)
+
+    body = _upload(client, ["id_front.png", "id_back.png", "old_id.png", "id_front.png", "id_back.png", "old_id.png"]).json()
+
+    assert body["status"] == "success"
+    assert body["form_data"][0]["status"] == "success"
+    card, old, front_again, back_again, old_again = body["documents"]
+    assert (card["merged"], card["status"]) == (True, "valid")
+    assert [source["file_name"] for source in card["sources"]] == ["id_front.png", "id_back.png"]
+    assert (old["status"], old["ignored_reason"], old["error"]) == ("ignored", "expired_copy", None)
+    assert old["note"] == ("An older National ID that has expired. "
+                           "The valid National ID in 'id_front.png' and 'id_back.png' is used.")
+    for again, name in ((front_again, "id_front.png"), (back_again, "id_back.png")):
+        assert (again["status"], again["ignored_reason"], again["error"]) == ("ignored", "duplicate", None)
+        assert again["note"] == f"This National ID was uploaded more than once. The one in '{name}' is used."
+        assert again["tenant_ids"] == ["tenant_1"]
+    # A repeat of the expired copy is set aside for the same reason as its original.
+    assert (old_again["status"], old_again["ignored_reason"], old_again["note"]) == ("ignored", "expired_copy", old["note"])
+
+
+def test_a_card_sent_as_two_files_and_again_as_one_combined_file_is_a_duplicate(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Front and back as two files, plus the same card's two sides combined into one file by the user:
+    # different file content, so it is recognised after reading - by the same ID number.
+    monkeypatch.setattr(settings, "validation_enabled", True)
+    _one_card_two_files(
+        monkeypatch,
+        extra={"both.png": [_region("national_id", 1, TOP_HALF, side="front"),
+                            _region("national_id", 1, BOTTOM_HALF, side="back")]},
+        answers={"both.png": _raw(["national_id"], National_Id="784-1980-1111111-1", Occupation="Engineer", **AHMED)},
+    )
+
+    async def nothing_wrong(**kwargs: Any) -> list[Any]:
+        return []
+
+    monkeypatch.setattr(get_gemini_service(), "verify_document", nothing_wrong)
+    monkeypatch.setattr(get_gemini_service(), "verify_documents_cross", nothing_wrong)
+
+    body = _upload(client, ["id_front.png", "id_back.png", "both.png"]).json()
+
+    assert body["status"] == "success"
+    card, combined = body["documents"]
+    assert (card["merged"], card["status"]) == (True, "valid")
+    assert (combined["status"], combined["ignored_reason"], combined["error"]) == ("ignored", "duplicate", None)
+    assert combined["note"] == ("This National ID was uploaded more than once. "
+                                "The one in 'id_front.png' and 'id_back.png' is used.")
 
 
 def test_a_failed_card_sent_as_two_files_is_one_entry_with_one_message(
@@ -1784,7 +1860,45 @@ def test_an_expired_copy_is_set_aside_when_a_valid_copy_of_that_document_is_uplo
     new, old = body["documents"]
     assert new["status"] == "valid"
     assert (old["status"], old["tenant_ids"]) == ("ignored", ["tenant_1"])
-    assert old["error"] == "This National ID has expired; the valid National ID uploaded with it is used instead."
+    # Never an error (the front end shows every error): the reason is a code, the note plain words.
+    assert (old["error"], old["ignored_reason"]) == (None, "expired_copy")
+    # The note names the user's own file, never an internal label like 'National ID 1'.
+    assert old["note"] == "An older National ID that has expired. The valid National ID in 'new_id.png' is used."
+
+
+def test_the_note_says_where_the_used_copy_is_when_its_file_holds_other_documents(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "validation_enabled", True)
+    _stub(
+        monkeypatch,
+        segments={"bundle.png": [_region("national_id", 1, TOP_HALF), _region("passport", 2, BOTTOM_HALF)],
+                  "old_id.png": [_region("national_id", 1)]},
+        answers={
+            "bundle_1_national_id": _raw(["national_id"], National_Id="784-1978-2940540-2",
+                                         National_Id_Expiry="03/07/2027", **ANUP),
+            "bundle_2_passport": _raw(["passport"], Passport_Number="Z4918629", Passport_Expiry="28/07/2030", **ANUP),
+            "old_id.png": _raw(["national_id"], National_Id="784-1978-2940540-2", National_Id_Expiry="11/06/2025", **ANUP),
+        },
+    )
+    old_width = _WIDTHS["old_id.png"]
+
+    async def fake_verify(**kwargs: Any) -> list[str]:
+        with Image.open(io.BytesIO(kwargs["content"])) as image:
+            expired = image.width == old_width
+        return ["Your National ID expired on 11-06-2025. Please upload a valid National ID."] if expired else []
+
+    async def no_conflicts(**kwargs: Any) -> list[Any]:
+        return []
+
+    monkeypatch.setattr(get_gemini_service(), "verify_document", fake_verify)
+    monkeypatch.setattr(get_gemini_service(), "verify_documents_cross", no_conflicts)
+
+    body = _upload(client, ["bundle.png", "old_id.png"]).json()
+
+    old = next(d for d in body["documents"] if d["sources"][0]["file_name"] == "old_id.png")
+    assert (old["status"], old["error"]) == ("ignored", None)
+    assert old["note"] == "An older National ID that has expired. The valid National ID on page 1 of 'bundle.png' is used."
 
 
 def test_only_expired_copies_still_fail_the_tenant(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:

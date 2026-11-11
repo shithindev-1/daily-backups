@@ -26,6 +26,7 @@ from app.services.gemini import (
 )
 from app.services.leasing import sources as source_fetch
 from app.services.leasing.batch import process_batch
+from app.services.leasing.outcomes import log_document_results, outcome
 from app.services.leasing.rules import require_mandatory_document
 from app.services.leasing.sources import safe_name
 from app.services.ocr_pipeline import VerificationUnavailable, call_with_one_retry, log_request_usage
@@ -57,6 +58,7 @@ async def _segment_one(item: dict[str, Any], request_id: str) -> None:
         )
     except HTTPException as exc:
         item["error"] = f"'{_file_name(item)}': {exc.detail}"
+        item["_stage"] = "file_check"
         return
     item["mime_type"] = validated.mime_type
     try:
@@ -73,6 +75,7 @@ async def _segment_one(item: dict[str, Any], request_id: str) -> None:
         item["error"] = (
             f"We could not read '{_file_name(item)}' right now. Please try again in a few minutes."
         )
+        item["_stage"] = "segmentation"
 
 
 def _labels(found: list[tuple[dict[str, Any], Segment]]) -> list[str]:
@@ -177,6 +180,40 @@ def locate_error(error: str | None, document_type: str, places: list[tuple[str, 
     return f"{label} found on {where}: {error}"
 
 
+def _where(names: list[str], origin: dict[str, tuple[dict[str, Any], Segment]], shared_files: set[int]) -> str:
+    """Where the user uploaded a document, in their own file names: "in 'EID-Front.jpeg' and
+    'EID-back.jpeg'", or "on page 2 of 'Documents.pdf'" when the file holds other documents too."""
+    by_file: dict[str, tuple[bool, list[int]]] = {}
+    for name in names:
+        item, segment = origin[name]
+        shared, pages = by_file.get(_file_name(item), (False, []))
+        by_file[_file_name(item)] = (shared or id(item) in shared_files, pages + list(segment.pages))
+    if not any(shared for shared, _ in by_file.values()):
+        return "in " + " and ".join(f"'{file_name}'" for file_name in by_file)
+    return " and ".join(
+        f"on {_pages_text(sorted(set(pages)))} of '{file_name}'" if shared and pages else f"in '{file_name}'"
+        for file_name, (shared, pages) in by_file.items()
+    )
+
+
+def _ignored_note(reason: str, document_type: str, where: str, *, original_failed: bool = False) -> str:
+    """The plain-English note on a copy set aside, naming the file of the copy that is used."""
+    label = document_label(document_type)
+    if reason == "duplicate" and original_failed:
+        return f"This {label} was uploaded more than once. Please fix the {label} {where}."
+    return {
+        "expired_copy": f"An older {label} that has expired. The valid {label} {where} is used.",
+        "replaced_copy": f"Another copy of this {label} was uploaded. The {label} {where} is used.",
+        "duplicate": f"This {label} was uploaded more than once. The one {where} is used.",
+        "older_copy": f"An older {label}. Please fix the {label} {where}.",
+    }[reason]
+
+
+def _log_files(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """A document's files for document-results.log: file names and pages only, never a link."""
+    return [{"file": source["file_name"], "pages": source["pages"]} for source in entry["sources"]]
+
+
 def _source_row(item: dict[str, Any], pages: list[int], ocr_file: str | None = None) -> dict[str, Any]:
     return {"source": item["source"], "file_name": _file_name(item), "pages": pages, "ocr_file": ocr_file}
 
@@ -208,7 +245,7 @@ async def process_detected(
     # A file that could not be read at all leaves nothing to judge the request by.
     if any(item.get("error") for item in items):
         log_request_usage(document_refnumber, "failed", settings.detection_enabled)
-        return finish("failed", [
+        entries = [
             document_entry(
                 document_type="unknown" if item.get("error") else "not_checked",
                 status="invalid" if item.get("error") else "not_checked",
@@ -216,7 +253,17 @@ async def process_detected(
                 error=item.get("error"),
             )
             for item in items
-        ])
+        ]
+        log_document_results(
+            request_id=document_refnumber, endpoint="detect", tenant_type=tenant_type, status="failed",
+            documents=[
+                outcome(number=number, names=[_file_name(item)], document_type=entry["document_type"],
+                        status=entry["status"], files=_log_files(entry), error=entry["error"],
+                        report={"_stage": item.get("_stage") or ("download" if item.get("error") else None)})
+                for number, (item, entry) in enumerate(zip(items, entries), start=1)
+            ],
+        )
+        return finish("failed", entries)
 
     found = [(item, segment) for item in items for segment in item["segments"]]
     supported = [(item, segment) for item, segment in found if segment.document_type != OTHER_TYPE]
@@ -247,9 +294,19 @@ async def process_detected(
         require_mandatory_document(
             tenant_type, [segment.document_type for _, segment in supported], accept_initial_approval=True,
         )
-    except HTTPException:
+    except HTTPException as exc:
         # Rejected after the split calls were already made - their tokens are still logged.
         log_request_usage(document_refnumber, "rejected", settings.detection_enabled)
+        log_document_results(
+            request_id=document_refnumber, endpoint="detect", tenant_type=tenant_type, status="rejected",
+            reason=str(exc.detail),
+            documents=[
+                outcome(number=number, names=[_file_name(item)], document_type=segment.document_type,
+                        status="not_checked", files=[{"file": _file_name(item), "pages": segment.pages}],
+                        report={}, error=None)
+                for number, (item, segment) in enumerate(found, start=1)
+            ],
+        )
         raise
 
     labels = _labels(supported)
@@ -265,7 +322,14 @@ async def process_detected(
 
     by_name = result.get("tenant_ids_by_name") or {}
     documents = []
-    for report in result["documents"]:
+    reports = result["documents"]
+    for report in reports:
+        if report.get("ignored") and report.get("_kept_names") and report.get("ignored_reason"):
+            where = _where(report["_kept_names"], origin, shared_files)
+            report["note"] = _ignored_note(report["ignored_reason"], report["document_type"], where,
+                                           original_failed=bool(report.get("_original_failed")))
+            if report.get("_detail"):
+                report["_detail"]["kept_where"] = where
         names = [source["document_name"] for source in report["sources"]]
         places = [
             (_file_name(origin[name][0]), origin[name][1].pages)
@@ -275,17 +339,37 @@ async def process_detected(
             tenant_ids=sorted({tenant_id for name in names for tenant_id in by_name.get(name, [])},
                               key=lambda tenant_id: int(tenant_id.rsplit("_", 1)[1])),
             document_type=report["document_type"],
-            # An expired copy set aside for a valid one (tenant_results) is reported, not failed.
+            # A copy set aside for another (tenant_results) is reported as ignored - with no error.
             status="ignored" if report.get("ignored") else "invalid" if report["error"] else "valid",
             merged=report["merged"],
             sources=[
                 _source_row(origin[name][0], origin[name][1].pages, source["ocr_file"])
                 for name, source in zip(names, report["sources"])
             ],
-            error=locate_error(report["error"], report["document_type"], places),
+            error=None if report.get("ignored") else locate_error(report["error"], report["document_type"], places),
+            ignored_reason=report.get("ignored_reason"),
+            note=report.get("note"),
         ))
     status = "failed" if unsupported else result["status"]
-    return finish(status, documents + unsupported, tenants=result.get("tenants") or [])
+    all_documents = documents + unsupported
+    log_document_results(
+        request_id=document_refnumber, endpoint="detect", tenant_type=tenant_type, status=status,
+        tenants=result.get("tenants") or [],
+        documents=[
+            outcome(
+                number=number,
+                names=([source["document_name"] for source in report["sources"]] if report is not None
+                       else [entry["document_type"]]),
+                document_type=entry["document_type"], status=entry["status"], files=_log_files(entry),
+                report=report if report is not None else {"_stage": "unsupported_document"},
+                error=entry["error"], tenant_ids=entry["tenant_ids"],
+            )
+            for number, (entry, report) in enumerate(
+                zip(all_documents, list(reports) + [None] * len(unsupported)), start=1,
+            )
+        ],
+    )
+    return finish(status, all_documents, tenants=result.get("tenants") or [])
 
 
 async def process_detected_sources(

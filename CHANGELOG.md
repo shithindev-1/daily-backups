@@ -5,6 +5,32 @@ major version means a change that existing callers must adapt to.
 
 ## Unreleased
 
+### Changed (type-detection endpoints - tell the .NET team)
+- **`error` now only ever means "the user must fix this".** Every `documents[]` entry gains two keys:
+  `ignored_reason` (`expired_copy` | `replaced_copy` | `duplicate` | `older_copy`, else null) and `note` (plain
+  words naming the file of the copy that is used, e.g. "An older National ID that has expired. The valid National
+  ID in 'EID-Front.jpeg' and 'EID-back.jpeg' is used.", else null). An `ignored` document has `error: null` - the front end can keep showing every non-null error.
+- **Copies a tenant doesn't need are set aside (`ignored`), never failing the tenant** - only when the copy is PROVEN
+  to be the same holder's (same document number, an ID/passport/visa number in common, same name + date of birth,
+  or exactly the same full name; licences: same licence number or company name):
+  - an expired or otherwise failed National ID, passport, visa, trade/commercial licence or initial approval next
+    to a valid one (`expired_copy` / `replaced_copy`) - only when it is provably the OLDER copy (its expiry is
+    read and not later than the valid one's); a failed copy that may be the newer one keeps its error;
+  - a renewed passport or licence next to the newer valid one - the one expiring last is used (`replaced_copy`);
+  - the same document uploaded twice (`duplicate`) - an exact repeat of a file is set aside before front/back
+    pairing, so sending an ID's front and back twice no longer fails the pairing; for bank statements, cheques and other documents that can
+    legitimately come several times, only the same file uploaded again;
+  - when every copy failed, the error stays on the newest copy only; older ones are `older_copy`.
+  A tenant's only copy, or another tenant's, always keeps its real error. A person shared by two company tenants
+  is judged once.
+
+### Added (logs only)
+- **`logs/document-results.log`**: one JSON object per request (detect and old leasing endpoints) - request and
+  tenant status, counts, and per document its type, files and pages, status, the step that failed it (`step` +
+  `why`), the message the caller got (long numbers masked, dates kept; `LOG_ERROR_MESSAGES=false` drops the text),
+  and for a set-aside copy which copy was kept, the proof and the error it would have had. Rejected detect requests
+  (missing mandatory document) are logged with their reason. A one-line summary also goes to ocr-api.log.
+
 ### Fixed (type-detection endpoints - tell the .NET team)
 - **A passport's pages sent as separate files are one passport.** Its back/address page is joined to the main page
   printing the same passport number (a page whose number can't be read: the one the model confirms): one entry,
@@ -12,9 +38,9 @@ major version means a change that existing callers must adapt to.
   tenant of its own ("No National ID was uploaded for the person on 'Passport 1'"). A page matching no uploaded
   passport gets "This passport page doesn't match any uploaded passport. Please upload its main page with it."
 - **An expired copy next to a valid one no longer fails the tenant.** When a tenant uploads a valid National ID,
-  passport or visa and also an older, expired copy of it, the expired copy is `status: "ignored"` with "This National
-  ID has expired; the valid National ID uploaded with it is used instead." - no processed file, nothing in form_data.
-  Only expired copies still fail as before.
+  passport or visa and also an older, expired copy of it, the expired copy is `status: "ignored"` - no processed
+  file, nothing in form_data (since 2026-11-11 with `ignored_reason`/`note` and no error; see above). Only expired
+  copies still fail as before.
 - **Names printed with or without a space match.** "ABD ALRAZAK MAMOUN BAROUDI" on the ID and "Abdalrazak Mamoun
   Baroudi" on a bank statement are the same person, so the statement is no longer rejected with "doesn't mention the
   tenant". At least two name parts must still match. Old endpoints unchanged.
@@ -110,6 +136,8 @@ major version means a change that existing callers must adapt to.
   regions now only need 0.5% of the page, and a region that falls back to the whole page paints nothing.
 - Cut-outs on a page shared with other documents keep a small margin (2% of the long edge), with other
   documents inside the margin painted out, so a tight split box no longer cuts a card's edge.
+
+### Fixed (type-detection endpoints)
 - **A document that doesn't belong to the tenant is now rejected on its own.** Every supporting
   document must be shown to belong to a tenant - also when there is only one: an individual's
   document must print their name or ID number, and a trade licence or initial approval must LIST

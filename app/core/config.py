@@ -92,6 +92,10 @@ class Settings(BaseSettings):
     # Writes every extraction's parsed fields - National ID, DOB, passport/visa numbers - to
     # logs/results.log. Development only: never enable where real customer documents are processed.
     log_extracted_results: bool = False
+    # logs/document-results.log keeps each failed document's message text - the reason it failed. A
+    # message can quote a value it compares (a name on the front and back, say); long numbers in it are
+    # always masked. false = only the step and reason code are logged, never the text.
+    log_error_messages: bool = True
     # Hosts a /ocr/leasing `source` URL may point at, besides the configured blob container
     # (comma-separated, exact hostnames). Empty = only the blob container. Stops the endpoint being
     # used to make the server fetch arbitrary or internal addresses.
